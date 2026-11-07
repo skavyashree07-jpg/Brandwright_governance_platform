@@ -1,6 +1,6 @@
 import os
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -165,6 +165,7 @@ def demo_client(monkeypatch):
 
     monkeypatch.setattr(settings, "SECRET_KEY", "test-secret-key-for-demo-login-tests-32")
     monkeypatch.setattr(settings, "DEMO_MODE", "true")
+    monkeypatch.setattr(settings, "JURY_DEMO_ENABLED", True)
     monkeypatch.setattr(api_v1, "_demo_login_attempts", {})
     monkeypatch.setattr(api_v1, "_demo_login_redis", OfflineRedis())
     app.dependency_overrides[get_db] = override_db
@@ -177,6 +178,59 @@ def test_demo_login_is_hidden_when_demo_mode_is_disabled(demo_client, monkeypatc
     client, *_ = demo_client
     monkeypatch.setattr(settings, "DEMO_MODE", "false")
     assert client.post("/api/v1/auth/demo-login", json={"role": "creator"}).status_code == 404
+
+
+def test_registered_user_login_still_works_when_demo_mode_is_disabled(demo_client, monkeypatch):
+    client, database, users, organisation = demo_client
+    monkeypatch.setattr(settings, "DEMO_MODE", "false")
+    database.query = lambda _model: SimpleNamespace(
+        filter=lambda *_criteria: SimpleNamespace(first=lambda: users[1])
+    )
+    monkeypatch.setattr(api_v1, "verify_password", lambda _password, _hashed: True)
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": users[1].email, "password": "valid-password"},
+    )
+
+    assert response.status_code == 200
+    claims = jwt.decode(response.json()["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    assert claims["sub"] == str(users[1].id)
+    assert claims["org_id"] == str(organisation.id)
+    assert claims["role"] == "reviewer"
+
+
+def test_login_accepts_arbitrary_credentials_only_in_demo_mode(demo_client):
+    client, database, users, organisation = demo_client
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": "not-an-email", "password": "any-password"},
+    )
+
+    assert response.status_code == 200
+    decoded = jwt.decode(
+        response.json()["access_token"],
+        settings.SECRET_KEY,
+        algorithms=[settings.ALGORITHM],
+    )
+    creator = next(user for user in users if user.role == "creator")
+    assert decoded["sub"] == str(creator.id)
+    assert decoded["org_id"] == str(organisation.id)
+    assert decoded["role"] == "creator"
+    assert any(getattr(event, "action", None) == "demo_login" for event in database.added)
+
+
+def test_login_keeps_password_authentication_when_demo_mode_is_disabled(demo_client, monkeypatch):
+    client, database, *_ = demo_client
+    monkeypatch.setattr(settings, "DEMO_MODE", "false")
+    database.records[User] = []
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": "not-an-email", "password": "any-password"},
+    )
+
+    assert response.status_code == 401
 
 
 @pytest.mark.parametrize("role", ["creator", "reviewer", "admin"])
@@ -260,6 +314,138 @@ def test_demo_session_is_scoped_to_its_organisation(demo_client):
     response = client.get("/api/v1/content", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     assert [item["title"] for item in response.json()] == ["Demo organisation content"]
+
+
+def test_jury_demo_login_starts_in_admin_and_marks_the_session(demo_client):
+    client, database, users, organisation = demo_client
+
+    response = client.post("/api/v1/auth/jury-demo-login")
+
+    assert response.status_code == 200
+    payload = jwt.decode(response.json()["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    admin = next(user for user in users if user.role == "admin")
+    assert payload["sub"] == str(admin.id)
+    assert payload["org_id"] == str(organisation.id)
+    assert payload["role"] == "admin"
+    assert payload["session_type"] == "jury_demo"
+    assert UUID(payload["jury_session_id"])
+    profile = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {response.json()['access_token']}"},
+    )
+    assert profile.status_code == 200
+    assert profile.json()["jury_demo"] is True
+    assert any(getattr(event, "action", None) == "jury_demo_login" for event in database.added)
+
+
+@pytest.mark.parametrize("role", ["reviewer", "creator", "admin"])
+def test_jury_role_switch_preserves_the_session_and_changes_role(demo_client, role):
+    client, _database, users, organisation = demo_client
+    initial = client.post("/api/v1/auth/jury-demo-login").json()["access_token"]
+    initial_claims = jwt.decode(initial, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+
+    response = client.post(
+        "/api/v1/auth/jury-switch-role",
+        json={"role": role},
+        headers={"Authorization": f"Bearer {initial}"},
+    )
+
+    assert response.status_code == 200
+    next_token = response.json()["access_token"]
+    claims = jwt.decode(next_token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    target_user = next(user for user in users if user.role == role)
+    assert claims["sub"] == str(target_user.id)
+    assert claims["org_id"] == str(organisation.id)
+    assert claims["role"] == role
+    assert claims["jury_session_id"] == initial_claims["jury_session_id"]
+    assert claims["exp"] == initial_claims["exp"]
+    profile = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {next_token}"})
+    assert profile.json()["role"] == role
+    assert profile.json()["jury_demo"] is True
+
+
+def test_jury_demo_endpoint_is_disabled_by_configuration(demo_client, monkeypatch):
+    client, *_ = demo_client
+    token = client.post("/api/v1/auth/jury-demo-login").json()["access_token"]
+    monkeypatch.setattr(settings, "JURY_DEMO_ENABLED", False)
+    assert client.post("/api/v1/auth/jury-demo-login").status_code == 404
+    assert client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    ).status_code == 401
+
+
+def test_non_jury_demo_session_cannot_switch_roles(demo_client):
+    client, *_ = demo_client
+    token = client.post("/api/v1/auth/demo-login", json={"role": "creator"}).json()["access_token"]
+    response = client.post(
+        "/api/v1/auth/jury-switch-role",
+        json={"role": "admin"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_jury_demo_session_cannot_switch_from_another_organisation(demo_client):
+    client, database, _users, _demo_organisation = demo_client
+    other_organisation = next(
+        org for org in database.records[Organisation]
+        if org.name != api_v1.DEMO_ORGANISATION_NAME
+    )
+    other_admin = User(
+        id=uuid4(),
+        email="admin@other.example.invalid",
+        hashed_password="not-returned",
+        role="admin",
+        organisation_id=other_organisation.id,
+    )
+    database.records[User].append(other_admin)
+    token = api_v1.create_access_token({
+        "sub": str(other_admin.id),
+        "org_id": str(other_admin.organisation_id),
+        "role": other_admin.role,
+        "session_type": "jury_demo",
+        "jury_session_id": str(uuid4()),
+    })
+    profile = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert profile.status_code == 401
+    response = client.post(
+        "/api/v1/auth/jury-switch-role",
+        json={"role": "reviewer"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 401
+
+
+def test_expired_jury_demo_session_cannot_switch_roles(demo_client):
+    from datetime import timedelta
+
+    client, _database, users, organisation = demo_client
+    admin = next(user for user in users if user.role == "admin")
+    token = api_v1.create_access_token({
+        "sub": str(admin.id),
+        "org_id": str(organisation.id),
+        "role": admin.role,
+        "session_type": "jury_demo",
+        "jury_session_id": str(uuid4()),
+    }, expires_delta=timedelta(seconds=-1))
+    response = client.post(
+        "/api/v1/auth/jury-switch-role",
+        json={"role": "reviewer"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 401
+
+
+def test_jury_role_switch_rejects_roles_outside_the_allowlist(demo_client):
+    client, *_ = demo_client
+    token = client.post("/api/v1/auth/jury-demo-login").json()["access_token"]
+    response = client.post(
+        "/api/v1/auth/jury-switch-role",
+        json={"role": "manager"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 422
 
 
 def test_review_uses_sync_fallback_when_redis_is_unavailable(monkeypatch):

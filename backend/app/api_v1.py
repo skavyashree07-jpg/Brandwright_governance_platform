@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from redis import Redis
 
 from app.audit import log_audit
-from app.config import settings
+from app.config import DEMO_ORGANISATION_NAME, DEMO_USER_EMAILS, settings
 from app.db import SessionLocal, get_db
 from app.insights.guideline_drafting import calculate_guideline_health, draft_rule_clarification
 from app.models import (
@@ -70,7 +70,14 @@ from app.schemas import (
     TokenSchema,
     UserSchema,
 )
-from app.security import create_access_token, get_current_user, require_role, verify_password
+from app.security import (
+    create_access_token,
+    get_current_user,
+    get_jury_session_claims,
+    get_token_payload,
+    require_role,
+    verify_password,
+)
 from app.storage import StorageUnavailable, read_file, store_file
 from app.trust.evaluator import evaluate_dataset
 from app.workflow import transition_content_status, trigger_fact_drift_alerts
@@ -80,7 +87,6 @@ api_router = APIRouter(prefix="/api/v1")
 logger = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_SUFFIXES = {".txt", ".md", ".csv", ".docx", ".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
-DEMO_ORGANISATION_NAME = "Brandwright Demo"
 DEMO_LOGIN_LIMIT = 10
 DEMO_LOGIN_WINDOW_SECONDS = 60
 _demo_login_attempts: dict[str, list[float]] = {}
@@ -151,13 +157,45 @@ def _enforce_demo_login_limit(client_ip: str, now: float | None = None) -> None:
                     _demo_login_attempts.pop(ip, None)
 
 
-def _access_token_response(user: User) -> dict[str, str]:
-    token = create_access_token({
+def _access_token_response(
+    user: User,
+    jury_session_id: UUID | None = None,
+    expires_delta: timedelta | None = None,
+) -> dict[str, str]:
+    claims = {
         "sub": str(user.id),
         "org_id": str(user.organisation_id),
         "role": user.role,
-    })
+    }
+    if jury_session_id is not None:
+        claims.update({
+            "session_type": "jury_demo",
+            "jury_session_id": str(jury_session_id),
+        })
+    token = create_access_token(claims, expires_delta=expires_delta)
     return {"access_token": token, "token_type": "bearer"}
+
+
+def _demo_user_for_role(db: Session, role: str) -> User:
+    organisation = db.query(Organisation).filter(
+        Organisation.name == DEMO_ORGANISATION_NAME
+    ).first()
+    if organisation is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Demo accounts are not ready yet. Please try again later.",
+        )
+    user = db.query(User).filter(
+        User.organisation_id == organisation.id,
+        User.email == DEMO_USER_EMAILS[role],
+        User.role == role,
+    ).first()
+    if user is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Demo accounts are not ready yet. Please try again later.",
+        )
+    return user
 
 
 def _content_or_404(db: Session, content_id: UUID, user: User) -> ContentItem:
@@ -378,7 +416,22 @@ def _schedule_review(db: Session, user: User, content: ContentItem, version: Con
 
 
 @api_router.post("/auth/login", response_model=TokenSchema)
-def login(payload: LoginSchema, db: Session = Depends(get_db)):
+def login(payload: LoginSchema, request: Request, db: Session = Depends(get_db)):
+    if settings.DEMO_MODE.casefold() == "true":
+        _enforce_demo_login_limit(request.client.host if request.client else "unknown")
+        user = _demo_user_for_role(db, "creator")
+        log_audit(
+            db,
+            str(user.organisation_id),
+            "demo_login",
+            "user",
+            str(user.id),
+            str(user.id),
+            details="role=creator",
+        )
+        db.commit()
+        return _access_token_response(user)
+
     user = db.query(User).filter(func.lower(User.email) == payload.email.lower()).first()
     if not user or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -391,23 +444,7 @@ def demo_login(payload: DemoLoginSchema, request: Request, db: Session = Depends
         raise HTTPException(status_code=404, detail="Not found")
 
     _enforce_demo_login_limit(request.client.host if request.client else "unknown")
-    organisation = db.query(Organisation).filter(
-        Organisation.name == DEMO_ORGANISATION_NAME
-    ).first()
-    if organisation is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Demo accounts are not ready yet. Please try again later.",
-        )
-    user = db.query(User).filter(
-        User.organisation_id == organisation.id,
-        User.role == payload.role,
-    ).first()
-    if user is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Demo accounts are not ready yet. Please try again later.",
-        )
+    user = _demo_user_for_role(db, payload.role)
 
     log_audit(
         db,
@@ -422,9 +459,68 @@ def demo_login(payload: DemoLoginSchema, request: Request, db: Session = Depends
     return _access_token_response(user)
 
 
+@api_router.post("/auth/jury-demo-login", response_model=TokenSchema)
+def jury_demo_login(request: Request, db: Session = Depends(get_db)):
+    if not settings.JURY_DEMO_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    _enforce_demo_login_limit(request.client.host if request.client else "unknown")
+    user = _demo_user_for_role(db, "admin")
+    log_audit(
+        db,
+        str(user.organisation_id),
+        "jury_demo_login",
+        "user",
+        str(user.id),
+        str(user.id),
+        details="role=admin",
+    )
+    db.commit()
+    return _access_token_response(user, jury_session_id=uuid4())
+
+
+@api_router.post("/auth/jury-switch-role", response_model=TokenSchema)
+def jury_switch_role(
+    payload: DemoLoginSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    jury_claims: dict[str, Any] = Depends(get_jury_session_claims),
+):
+    target_user = _demo_user_for_role(db, payload.role)
+    if current_user.organisation_id != target_user.organisation_id:
+        raise HTTPException(status_code=403, detail="Jury sessions are restricted to the demo organisation")
+
+    expires_delta = datetime.fromtimestamp(
+        jury_claims["exp"],
+        tz=timezone.utc,
+    ) - datetime.now(timezone.utc)
+    if expires_delta <= timedelta(0):
+        raise HTTPException(status_code=401, detail="Jury demo session has expired")
+
+    log_audit(
+        db,
+        str(current_user.organisation_id),
+        "jury_demo_role_switch",
+        "user",
+        str(current_user.id),
+        str(target_user.id),
+        details=f"role={target_user.role}",
+    )
+    db.commit()
+    return _access_token_response(
+        target_user,
+        jury_session_id=UUID(jury_claims["jury_session_id"]),
+        expires_delta=expires_delta,
+    )
+
+
 @api_router.get("/auth/me", response_model=UserSchema)
-def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+def get_me(
+    current_user: User = Depends(get_current_user),
+    token_payload: dict[str, Any] = Depends(get_token_payload),
+):
+    profile = UserSchema.model_validate(current_user)
+    return profile.model_copy(update={"jury_demo": token_payload.get("session_type") == "jury_demo"})
 
 
 @api_router.post("/kb/guidelines", status_code=status.HTTP_201_CREATED)

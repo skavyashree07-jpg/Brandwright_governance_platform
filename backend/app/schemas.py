@@ -19,6 +19,7 @@ class UserSchema(BaseModel):
     email: str
     role: str
     organisation_id: UUID
+    jury_demo: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 class RuleCreateSchema(BaseModel):

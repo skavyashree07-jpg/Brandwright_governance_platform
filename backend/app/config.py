@@ -1,5 +1,13 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEMO_ORGANISATION_NAME = "Brandwright Demo"
+DEMO_USER_EMAILS = {
+    "creator": "creator@demo.brandwright.app",
+    "reviewer": "reviewer@demo.brandwright.app",
+    "admin": "admin@demo.brandwright.app",
+}
+
+
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Brandwright API"
     VERSION: str = "1.0.0"
@@ -11,6 +19,7 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
     DEMO_MODE: str = "false"
+    JURY_DEMO_ENABLED: bool = False
     REVIEW_ASYNC: bool = False
     REVIEW_JOB_TIMEOUT_SECONDS: int = 300
     RETRIEVER: str = "memory"
@@ -23,6 +32,7 @@ class Settings(BaseSettings):
     MINIO_SECURE: bool = False
     CORS_ORIGINS: str = "http://localhost:3000"
     LLM_MODE: str = "MOCK"
+    MINIO_REGION: str = "ap-northeast-1"
     model_config = SettingsConfigDict(env_file=("../.env", ".env"), extra="ignore")
 
 settings = Settings()

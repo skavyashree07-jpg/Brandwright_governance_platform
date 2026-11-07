@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.config import DEMO_USER_EMAILS
 from app.api_v1 import DEMO_ORGANISATION_NAME
 from app.db import SessionLocal
 from app.models import (
@@ -32,11 +33,7 @@ from app.review.embeddings import create_embedder, term_embedding_text
 from app.security import get_password_hash
 
 
-DEMO_USERS = {
-    "creator": "creator@demo.brandwright.app",
-    "reviewer": "reviewer@demo.brandwright.app",
-    "admin": "admin@demo.brandwright.app",
-}
+DEMO_USERS = DEMO_USER_EMAILS
 
 
 def _one(db: Session, model, **filters):
