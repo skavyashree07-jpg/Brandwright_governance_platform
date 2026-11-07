@@ -2,7 +2,13 @@ const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/
 export const API = API_BASE;
 
 export type Role = "creator" | "manager" | "reviewer" | "admin";
-export type User = { id: string; email: string; role: Role; organisation_id: string };
+export type User = {
+  id: string;
+  email: string;
+  role: Role;
+  organisation_id: string;
+  jury_demo?: boolean;
+};
 export type Content = {
   id: string; title: string | null; current_version_no: number; status: string; created_at?: string;
 };
@@ -120,8 +126,15 @@ const post = <T,>(path: string, body?: unknown) => request<T>(path, {
 
 export const api = {
   login: (email: string, password: string) =>
-    post<{ access_token: string; token_type: string }>("/auth/login", { email, password }),
-  me: () => get<User>("/auth/me"),
+  post<{ access_token: string; token_type: string }>("/auth/login", { email, password }),
+
+juryDemoLogin: () =>
+  post<{ access_token: string; token_type: string }>("/auth/jury-demo-login"),
+
+jurySwitchRole: (role: "admin" | "reviewer" | "creator") =>
+  post<{ access_token: string; token_type: string }>("/auth/jury-switch-role", { role }),
+
+me: () => get<User>("/auth/me"),
   rules: () => get<Rule[]>("/kb/rules"),
   facts: () => get<Fact[]>("/kb/facts"),
   contentList: () => get<Content[]>("/content"),

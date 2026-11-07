@@ -23,6 +23,8 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const isPublic = path === "/" || path === "/login";
   const [user, setUser] = useState<User | null>(null);
   const [bootError, setBootError] = useState("");
+  const [roleBusy, setRoleBusy] = useState(false);
+  const [roleError, setRoleError] = useState("");
 
   useEffect(() => {
     if (isPublic || user) return;
@@ -38,8 +40,41 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     });
     return () => { active = false; };
   }, [isPublic, user, router]);
-
   const links = useMemo(() => user ? LINKS.filter((link) => link.roles.includes(user.role)) : [], [user]);
+  async function switchJuryRole(role: "admin" | "reviewer" | "creator") {
+  if (!user?.jury_demo || roleBusy) return;
+
+  setRoleBusy(true);
+  setRoleError("");
+
+  try {
+    const result = await api.jurySwitchRole(role);
+
+    tk.set(result.access_token);
+
+    const updatedUser = await api.me();
+
+    if (!updatedUser.jury_demo) {
+      throw new Error("Jury session verification failed.");
+    }
+
+    setUser(updatedUser);
+
+    const destination = {
+      admin: "/insights",
+      reviewer: "/queue",
+      creator: "/workspace",
+    }[role];
+
+    router.replace(destination);
+  } catch (error) {
+    setRoleError(
+      error instanceof Error ? error.message : "Could not switch roles."
+    );
+  } finally {
+    setRoleBusy(false);
+  }
+}
   const activeLink = links.find((link) => path.startsWith(link.href));
   useEffect(() => {
     if (user && !activeLink && links.length) router.replace(links[0].href);
@@ -74,11 +109,43 @@ export default function Shell({ children }: { children: React.ReactNode }) {
               <div className="topbar-title">{activeLink.label}</div>
             </div>
             <div className="account-chip">
-              <span className="status-dot" />
-              <span>{user.email}</span>
-              <span className="role-pill">{user.role}</span>
-            </div>
+  <span className="status-dot" />
+  <span>{user.email}</span>
+  <span className="role-pill">{user.role}</span>
+
+  {user.jury_demo === true && (
+    <select
+      aria-label="Switch jury demo role"
+      value={user.role}
+      disabled={roleBusy}
+      onChange={(event) =>
+        switchJuryRole(event.target.value as "admin" | "reviewer" | "creator")
+      }
+      style={{
+        padding: "7px",
+        borderRadius: "6px",
+        border: "1px solid #d9e4f4",
+        cursor: "pointer",
+      }}
+    >
+      <option value="admin">Admin</option>
+      <option value="reviewer">Reviewer</option>
+      <option value="creator">Creator</option>
+    </select>
+  )}
+</div>
           </header>
+          {roleError && (
+  <p className="alert error" role="alert">
+    {roleError}
+  </p>
+)}
+
+{roleBusy && (
+  <p role="status" style={{ padding: "8px 20px" }}>
+    Switching demo role...
+  </p>
+)}
           <div className="app-workarea">
             <main id="main" tabIndex={-1} className="app-content">
               {children}
