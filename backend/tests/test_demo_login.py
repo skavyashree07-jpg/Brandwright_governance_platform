@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -7,6 +8,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from jose import jwt
 from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.sql import operators
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-demo-login-tests-32")
 
@@ -14,14 +16,19 @@ from app import api_v1
 from app.db import get_db
 from app.main import app
 from app.models import (
+    Brand,
     ContentItem,
     ContentVersion,
+    Fact,
     Finding,
     FindingDecision,
     Organisation,
+    Rule,
+    Term,
     User,
 )
 from app.config import settings
+from app.review.integration import _fact_sources, _rule_sources
 import seed
 
 
@@ -49,20 +56,40 @@ class FakeQuery:
     def _matches(self, record):
         if any(getattr(record, key, None) != value for key, value in self.filters.items()):
             return False
-        for expression in self.criteria:
+        def matches_expression(expression):
+            clauses = getattr(expression, "clauses", None)
+            if clauses is not None:
+                checks = [matches_expression(clause) for clause in clauses]
+                if expression.operator is operators.or_:
+                    return any(checks)
+                if expression.operator is operators.and_:
+                    return all(checks)
+                return False
             if not hasattr(expression, "left") or not hasattr(expression, "right"):
                 return False
             key = getattr(expression.left, "key", None)
+            current = getattr(record, key, None)
             value = getattr(expression.right, "value", None)
-            if str(getattr(record, key, None)) != str(value):
-                return False
-        return True
+            if expression.operator is operators.is_:
+                return current is value
+            if expression.operator is operators.is_not:
+                return current is not value
+            if expression.operator is operators.eq:
+                return current == value or str(current) == str(value)
+            if expression.operator is operators.gt:
+                return current is not None and current > value
+            return False
+
+        return all(matches_expression(expression) for expression in self.criteria)
 
     def first(self):
         return next((row for row in self.database.records.get(self.model, []) if self._matches(row)), None)
 
     def all(self):
         return [row for row in self.database.records.get(self.model, []) if self._matches(row)]
+
+    def __iter__(self):
+        return iter(self.all())
 
 
 class FakeDatabase:
@@ -178,6 +205,115 @@ def test_demo_login_is_hidden_when_demo_mode_is_disabled(demo_client, monkeypatc
     client, *_ = demo_client
     monkeypatch.setattr(settings, "DEMO_MODE", "false")
     assert client.post("/api/v1/auth/demo-login", json={"role": "creator"}).status_code == 404
+
+
+def test_admin_brand_management_and_read_only_brand_access(demo_client):
+    client, database, users, organisation = demo_client
+
+    def headers(role):
+        response = client.post("/api/v1/auth/demo-login", json={"role": role})
+        assert response.status_code == 200
+        return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+    admin_headers = headers("admin")
+    created = client.post(
+        "/api/v1/brands",
+        headers=admin_headers,
+        json={
+            "name": "Northwind Studio",
+            "industry": "Education",
+            "website_url": "https://northwind.example",
+            "primary_colour": "#244B3D",
+        },
+    )
+    assert created.status_code == 201
+    brand = created.json()
+    assert brand["name"] == "Northwind Studio"
+    assert "logo_file_key" not in brand
+    assert "organisation_id" not in brand
+
+    updated = client.patch(
+        f"/api/v1/brands/{brand['id']}",
+        headers=admin_headers,
+        json={"description": "A learning studio", "voice": "Friendly"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["description"] == "A learning studio"
+
+    creator_headers = headers("creator")
+    listed = client.get("/api/v1/brands", headers=creator_headers)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [brand["id"]]
+    assert client.get(f"/api/v1/brands/{brand['id']}", headers=headers("reviewer")).status_code == 200
+    assert client.post("/api/v1/brands", headers=creator_headers, json={"name": "Not allowed"}).status_code == 403
+    assert client.patch(
+        f"/api/v1/brands/{brand['id']}",
+        headers=creator_headers,
+        json={"name": "Not allowed"},
+    ).status_code == 403
+
+    other_org = next(row for row in database.records[Organisation] if row.id != organisation.id)
+    foreign_brand = Brand(
+        id=uuid4(),
+        organisation_id=other_org.id,
+        name="Private Other Brand",
+        status="active",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    database.records.setdefault(Brand, []).append(foreign_brand)
+    assert client.get(f"/api/v1/brands/{foreign_brand.id}", headers=admin_headers).status_code == 404
+
+    archived = client.post(f"/api/v1/brands/{brand['id']}/archive", headers=admin_headers)
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "archived"
+    assert client.get("/api/v1/brands", headers=admin_headers).json() == []
+    assert client.get("/api/v1/brands?include_archived=true", headers=admin_headers).json()[0]["id"] == brand["id"]
+
+
+def test_brand_schema_rejects_bad_urls_and_colours():
+    from pydantic import ValidationError
+
+    from app.schemas import BrandCreateSchema
+
+    with pytest.raises(ValidationError):
+        BrandCreateSchema(name="A brand", website_url="javascript:alert(1)")
+    with pytest.raises(ValidationError):
+        BrandCreateSchema(name="A brand", primary_colour="green")
+
+
+def test_review_sources_include_shared_and_only_the_selected_brand(demo_client):
+    _client, database, _users, organisation = demo_client
+    selected_brand_id = uuid4()
+    other_brand_id = uuid4()
+    database.records[Rule] = [
+        Rule(id=uuid4(), organisation_id=organisation.id, brand_id=None, clause_number="S1", text="Shared rule", category="tone", status="approved"),
+        Rule(id=uuid4(), organisation_id=organisation.id, brand_id=selected_brand_id, clause_number="B1", text="Selected rule", category="tone", status="approved"),
+        Rule(id=uuid4(), organisation_id=organisation.id, brand_id=other_brand_id, clause_number="O1", text="Other rule", category="tone", status="approved"),
+    ]
+    database.records[Term] = [
+        Term(id=uuid4(), organisation_id=organisation.id, brand_id=None, preferred="shared", banned="common"),
+        Term(id=uuid4(), organisation_id=organisation.id, brand_id=other_brand_id, preferred="other", banned="different"),
+    ]
+    database.records[Fact] = [
+        Fact(id=uuid4(), organisation_id=organisation.id, brand_id=None, text="Shared fact", status="approved", expires_at=None),
+        Fact(id=uuid4(), organisation_id=organisation.id, brand_id=selected_brand_id, text="Selected fact", status="approved", expires_at=None),
+        Fact(id=uuid4(), organisation_id=organisation.id, brand_id=other_brand_id, text="Other fact", status="approved", expires_at=None),
+    ]
+
+    unbranded_rules = _rule_sources(database, organisation.id)
+    unbranded_facts = _fact_sources(database, organisation.id)
+    selected_rules = _rule_sources(database, organisation.id, selected_brand_id)
+    selected_facts = _fact_sources(database, organisation.id, selected_brand_id)
+
+    assert {source["text"] for source in unbranded_rules} == {"Shared rule", 'Use “shared” instead of “common”.'}
+    assert {source["text"] for source in unbranded_facts} == {"Shared fact"}
+    assert {source["text"] for source in selected_rules} == {
+        "Shared rule",
+        "Selected rule",
+        'Use “shared” instead of “common”.',
+    }
+    assert {source["text"] for source in selected_facts} == {"Shared fact", "Selected fact"}
 
 
 def test_registered_user_login_still_works_when_demo_mode_is_disabled(demo_client, monkeypatch):

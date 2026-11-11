@@ -7,8 +7,7 @@ import { api, tk } from "@/lib/api";
 const { replace } = vi.hoisted(() => ({ replace: vi.fn() }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ replace }) }));
 vi.mock("@/lib/api", () => ({
-  ApiError: class extends Error { status = 0; },
-  api: { login: vi.fn(), demoLogin: vi.fn(), me: vi.fn() },
+  api: { login: vi.fn(), juryDemoLogin: vi.fn(), me: vi.fn() },
   errText: (error: unknown) => error instanceof Error ? error.message : "Request failed",
   tk: { set: vi.fn() },
 }));
@@ -28,30 +27,35 @@ function renderLogin() {
 }
 
 describe("Login interactions", () => {
-  it("supports password visibility, password help, and clearly marked SSO placeholders", () => {
+  it("supports password visibility", () => {
     const { container } = renderLogin();
     const password = container.querySelector<HTMLInputElement>("#p")!;
     expect(password.type).toBe("password");
     fireEvent.click(screen.getByRole("button", { name: "Show password" }));
     expect(password.type).toBe("text");
-
-    fireEvent.click(screen.getByRole("button", { name: "Forgot password?" }));
-    expect(screen.getByRole("heading", { name: "Password help" })).toBeTruthy();
-    expect(screen.getByText(/Password recovery is not available in this API/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Back to sign in" }));
-    fireEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
-    expect(screen.getByRole("status").textContent).toContain("No SSO endpoint is configured");
   });
 
-  it("hides demo access unless the public demo flag is enabled", () => {
-    vi.stubEnv("NEXT_PUBLIC_DEMO_MODE", "false");
+  it("enters the jury demo as admin without credentials", async () => {
+    vi.mocked(api.juryDemoLogin).mockResolvedValue({ access_token: "jury-token", token_type: "bearer" });
+    vi.mocked(api.me).mockResolvedValue({
+      id: "admin-id",
+      email: "admin@demo.brandwright.app",
+      role: "admin",
+      organisation_id: "demo-org",
+      jury_demo: true,
+    });
     renderLogin();
-    expect(screen.queryByRole("button", { name: /Continue as Creator/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Explore as Jury" }));
+
+    await waitFor(() => expect(api.juryDemoLogin).toHaveBeenCalledOnce());
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("/workspace"));
+    expect(tk.set).toHaveBeenCalledWith("jury-token");
+    expect(api.login).not.toHaveBeenCalled();
   });
 
-  it("signs in as the selected demo role and redirects using the profile role", async () => {
-    vi.stubEnv("NEXT_PUBLIC_DEMO_MODE", "true");
-    vi.mocked(api.demoLogin).mockResolvedValue({ access_token: "demo-token", token_type: "bearer" });
+  it("accepts any non-empty email and password, then opens the demo workspace", async () => {
+    vi.mocked(api.login).mockResolvedValue({ access_token: "demo-token", token_type: "bearer" });
     vi.mocked(api.me).mockResolvedValue({
       id: "creator-id",
       email: "creator@demo.brandwright.app",
@@ -60,37 +64,31 @@ describe("Login interactions", () => {
     });
     renderLogin();
 
-    fireEvent.click(screen.getByRole("button", { name: /Continue as Creator/ }));
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "not-an-email" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "anything" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enter workspace" }));
 
-    await waitFor(() => expect(api.demoLogin).toHaveBeenCalledWith("creator"));
+    await waitFor(() => expect(api.login).toHaveBeenCalledWith("not-an-email", "anything"));
     await waitFor(() => expect(replace).toHaveBeenCalledWith("/dashboard"));
     expect(tk.set).toHaveBeenCalledWith("demo-token");
-    expect(screen.getByText("Demo environment, sample data only.")).toBeTruthy();
   });
 
-  it("disables demo role buttons while signing in and shows request errors", async () => {
-    vi.stubEnv("NEXT_PUBLIC_DEMO_MODE", "true");
-    let rejectDemo!: (error: Error) => void;
-    vi.mocked(api.demoLogin).mockReturnValue(new Promise((_, reject) => { rejectDemo = reject; }));
+  it("requires non-empty credentials", async () => {
     renderLogin();
 
-    fireEvent.click(screen.getByRole("button", { name: /Continue as Reviewer/ }));
-    const demoButtons = Array.from(document.querySelectorAll<HTMLButtonElement>(".demo-login-button"));
-    expect(demoButtons[1].textContent).toContain("Signing in...");
-    expect(demoButtons.every(button => button.disabled)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Enter workspace" }));
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Enter your email.");
+    expect(api.login).not.toHaveBeenCalled();
+  });
 
-    rejectDemo(new Error("Demo unavailable"));
+  it("shows login request errors", async () => {
+    vi.mocked(api.login).mockRejectedValue(new Error("Demo unavailable"));
+    renderLogin();
+
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "any-email" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "any-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enter workspace" }));
+
     expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Demo unavailable");
-  });
-
-  it("offers a retry when demo sign-in times out", async () => {
-    vi.stubEnv("NEXT_PUBLIC_DEMO_MODE", "true");
-    vi.mocked(api.demoLogin).mockRejectedValue(new DOMException("Timed out", "TimeoutError"));
-    renderLogin();
-
-    fireEvent.click(screen.getByRole("button", { name: /Continue as Admin/ }));
-
-    expect(await screen.findByText(/demo server is waking up/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Retry demo sign-in" })).toBeTruthy();
   });
 });

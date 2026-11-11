@@ -3,7 +3,7 @@ import { ChangeEvent, FormEvent, useCallback, useEffect, useState } from "react"
 import * as Tabs from "@radix-ui/react-tabs";
 import { useQuery } from "@tanstack/react-query";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { useUser } from "@/components/Shell";
+import { useBrand, useUser } from "@/components/Shell";
 import { z } from "zod";
 import {
   api, errText, Asset, Fact, FactDriftAlert, GuidelineHealth, Overview, Rule, Term,
@@ -21,6 +21,7 @@ type InsightKey = "health" | "drift" | "overview" | "rules" | "facts" | "terms" 
 
 export default function Insights() {
   const user = useUser();
+  const { activeBrandId } = useBrand();
   const [health, setHealth] = useState<GuidelineHealth[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
   const [facts, setFacts] = useState<Fact[]>([]);
@@ -44,7 +45,7 @@ export default function Insights() {
   const [savedTrustRun, setSavedTrustRun] = useState<TrustScorecard | null>(null);
 
   const { data: snapshot, isPending: loading, refetch } = useQuery({
-    queryKey: ["governance-insights", user.organisation_id],
+    queryKey: ["governance-insights", user.organisation_id, activeBrandId],
     queryFn: async () => {
       const results = await Promise.allSettled([
         api.health(), api.drift(), api.overview(), api.rules(),
@@ -67,6 +68,18 @@ export default function Insights() {
       };
     },
   });
+
+  useEffect(() => {
+    setHealth([]);
+    setRules([]);
+    setFacts([]);
+    setTerms([]);
+    setAssets([]);
+    setDrift([]);
+    setOverview(null);
+    setClarifications({});
+    setErrors([]);
+  }, [activeBrandId]);
 
   useEffect(() => {
     if (!snapshot) return;

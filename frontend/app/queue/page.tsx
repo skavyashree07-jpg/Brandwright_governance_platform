@@ -5,7 +5,7 @@ import { ChevronDown, ClipboardCheck } from "lucide-react";
 import { api, errText, isRisky, isUnverified, Comment, Content, ContentDetail, Finding } from "@/lib/api";
 import { useSourceLabel } from "@/lib/kb";
 import { Annotated } from "@/components/Annotated";
-import { useUser } from "@/components/Shell";
+import { useBrand, useUser } from "@/components/Shell";
 import { downloadCsv } from "@/lib/csv";
 import { Button, Input, Select } from "@/components/ui";
 
@@ -186,6 +186,7 @@ function ReviewDetail({ it, onChanged }: { it: Content; onChanged: () => void })
 
 export default function Queue() {
   const user = useUser();
+  const { activeBrandId } = useBrand();
   const [openId, setOpenId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -202,10 +203,17 @@ export default function Queue() {
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
   const [preferencesError, setPreferencesError] = useState("");
   const { data: items, error, isPending, refetch } = useQuery({
-    queryKey: ["review-queue", user.organisation_id],
+    queryKey: ["review-queue", user.organisation_id, activeBrandId],
     queryFn: api.queue,
     refetchInterval: 30_000,
   });
+  useEffect(() => {
+    setOpenId(null);
+    setSelectedIds([]);
+    setBulkComment("");
+    setBulkError("");
+    setBulkMessage("");
+  }, [activeBrandId]);
   const err = error ? errText(error) : "";
   const preferencesKey = `bw_queue_preferences:${user.organisation_id}:${user.id}`;
   useEffect(() => {

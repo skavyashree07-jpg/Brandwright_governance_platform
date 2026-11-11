@@ -19,9 +19,11 @@ class PgVectorRetriever:
         db: Session,
         organisation_id: UUID,
         embedder: Embedder | None = None,
+        brand_id: UUID | None = None,
     ):
         self.db = db
         self.organisation_id = organisation_id
+        self.brand_id = brand_id
         self.embedder = embedder or create_embedder()
 
     def _query_rows(self, model: Any, query_vector: list[float], limit: int, channel: str | None):
@@ -29,6 +31,9 @@ class PgVectorRetriever:
         query = self.db.query(model, distance).filter(
             model.organisation_id == self.organisation_id,
             model.embedding.is_not(None),
+        )
+        query = query.filter(
+            or_(model.brand_id.is_(None), model.brand_id == self.brand_id)
         )
         if model is Rule:
             query = query.filter(

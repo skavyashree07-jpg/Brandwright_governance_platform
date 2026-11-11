@@ -109,3 +109,73 @@ def test_retrieval_ai_finding_must_cite_retrieved_source():
     ai_finding = next(item for item in result["findings"] if item.check_type == "retrieval_ai")
     assert ai_finding.source["id"] == source_id
     assert ai_finding.suggestion["intent_preserved"] is True
+
+
+def test_claim_verification_flags_broadened_qualified_facts():
+    facts = [{
+        "id": str(uuid4()),
+        "text": "Our battery lasts up to 12 hours under laboratory conditions.",
+        "status": "approved",
+        "expires_at": None,
+    }]
+
+    result = review_text(
+        "Our battery lasts 12 hours under every operating condition.",
+        "Promote the product",
+        [],
+        facts,
+        content_id="content-qualified",
+        version_no=7,
+        local_only=True,
+    )
+
+    claim = next(item for item in result["findings"] if item.category == "claim")
+    assert claim.status == "cannot_verify"
+    assert "qualification" in claim.explanation.lower() or "scope" in claim.explanation.lower()
+    assert result["fact_usage"] == []
+
+
+def test_claim_verification_rejects_unqualified_guarantee_when_fact_is_conditional():
+    facts = [{
+        "id": str(uuid4()),
+        "text": "May improve performance by 10% for some customers.",
+        "status": "approved",
+        "expires_at": None,
+    }]
+
+    result = review_text(
+        "Will improve performance by 10% for every customer.",
+        "Promote the product",
+        [],
+        facts,
+        content_id="content-guarantee",
+        version_no=9,
+        local_only=True,
+    )
+
+    claim = next(item for item in result["findings"] if item.category == "claim")
+    assert claim.status == "cannot_verify"
+    assert "scope" in claim.explanation.lower() or "qualification" in claim.explanation.lower()
+    assert result["fact_usage"] == []
+
+
+def test_immutable_version_history_rejects_reused_version_numbers():
+    from fastapi import HTTPException
+
+    from app.workflow import ensure_version_history_is_immutable
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return object()
+
+    class FakeSession:
+        def query(self, *args, **kwargs):
+            return FakeQuery()
+
+    content = type("Content", (), {"id": uuid4(), "current_version_no": 2})()
+
+    with pytest.raises(HTTPException):
+        ensure_version_history_is_immutable(FakeSession(), content, 2)

@@ -6,6 +6,7 @@ import Insights from "./page";
 
 vi.mock("@/components/Shell", () => ({
   useUser: () => ({ id: "manager-1", email: "manager@brandwright.test", role: "manager", organisation_id: "org-1" }),
+  useBrand: () => ({ activeBrandId: null }),
 }));
 
 vi.mock("@/lib/api", () => ({

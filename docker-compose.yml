@@ -45,8 +45,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
       DEMO_MODE: ${DEMO_MODE:-false}
+      JURY_DEMO_ENABLED: ${JURY_DEMO_ENABLED:-false}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
-      MINIO_ENDPOINT: minio:9000
+      MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       REVIEW_ASYNC: ${REVIEW_ASYNC:-false}
@@ -74,7 +75,7 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-brandwright_db}
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
-      MINIO_ENDPOINT: minio:9000
+      MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       BRANDWRIGHT_MODEL_MODE: ${BRANDWRIGHT_MODEL_MODE:-mock}
@@ -94,7 +95,6 @@ services:
       context: ./frontend
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
-        NEXT_PUBLIC_DEMO_MODE: ${NEXT_PUBLIC_DEMO_MODE:-false}
     ports:
       - "3000:3000"
     depends_on:

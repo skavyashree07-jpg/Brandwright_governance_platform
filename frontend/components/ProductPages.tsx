@@ -5,7 +5,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, errText, Content, Finding, Rule, Fact, Term, Asset } from "@/lib/api";
-import { useUser } from "@/components/Shell";
+import { useBrand, useUser } from "@/components/Shell";
 import { Badge, Button, Card, Dialog, EmptyState, Input, Select, Skeleton, Textarea } from "@/components/ui";
 import { downloadCsv } from "@/lib/csv";
 import { useSourceLabel } from "@/lib/kb";
@@ -36,7 +36,8 @@ function Status({ value }: { value: string }) {
 
 function Dashboard() {
   const user = useUser();
-  const items = useQuery({ queryKey: ["content-list", user.organisation_id], queryFn: api.contentList });
+  const { activeBrandId } = useBrand();
+  const items = useQuery({ queryKey: ["content-list", user.organisation_id, activeBrandId], queryFn: api.contentList });
   const mine = (items.data ?? []).filter(item => item.creator_id === user.id);
   const open = mine.filter(item => ["changes_requested", "needs_recheck"].includes(item.status));
   const [checklistDismissed, setChecklistDismissed] = useState(false);
@@ -52,6 +53,7 @@ function Dashboard() {
 
 function Submissions() {
   const user = useUser();
+  const { activeBrandId } = useBrand();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [savedViews, setSavedViews] = useState<{ name: string; query: string; status: string }[]>([]);
@@ -59,7 +61,7 @@ function Submissions() {
   const [selectedView, setSelectedView] = useState("");
   const [viewError, setViewError] = useState("");
   const [viewsLoaded, setViewsLoaded] = useState(false);
-  const result = useQuery({ queryKey: ["content-list", user.organisation_id], queryFn: api.contentList });
+  const result = useQuery({ queryKey: ["content-list", user.organisation_id, activeBrandId], queryFn: api.contentList });
   const storageKey = `bw_submission_views:${user.organisation_id}:${user.id}`;
   useEffect(() => {
     try {
@@ -170,16 +172,24 @@ function ContentDetail({ id, review = false }: { id: string; review?: boolean })
 }
 
 function Knowledge() {
-  const user = useUser(); const client = useQueryClient();
+  const user = useUser(); const { activeBrand, activeBrandId, brands } = useBrand();
   const [tab, setTab] = useState("guidelines"); const [search, setSearch] = useState("");
   const [approvalFilter, setApprovalFilter] = useState("");
   const [open, setOpen] = useState(false); const [error, setError] = useState(""); const [success, setSuccess] = useState("");
   const [draft, setDraft] = useState({ clause_number: "", text: "", category: "messaging", fact: "", owner: "", preferred: "", banned: "", assetName: "" });
   const [file, setFile] = useState<File | null>(null);
-  const rules = useQuery({ queryKey: ["kb-rules", user.organisation_id], queryFn: api.rules });
-  const facts = useQuery({ queryKey: ["kb-facts", user.organisation_id], queryFn: api.facts });
-  const terms = useQuery({ queryKey: ["kb-terms", user.organisation_id], queryFn: api.terms });
-  const assets = useQuery({ queryKey: ["kb-assets", user.organisation_id], queryFn: api.assets });
+  const rules = useQuery({ queryKey: ["kb-rules", user.organisation_id, activeBrandId], queryFn: () => api.rules() });
+  const facts = useQuery({ queryKey: ["kb-facts", user.organisation_id, activeBrandId], queryFn: () => api.facts() });
+  const terms = useQuery({ queryKey: ["kb-terms", user.organisation_id, activeBrandId], queryFn: () => api.terms() });
+  const assets = useQuery({ queryKey: ["kb-assets", user.organisation_id, activeBrandId], queryFn: () => api.assets() });
+  useEffect(() => {
+    setOpen(false);
+    setDraft({ clause_number: "", text: "", category: "messaging", fact: "", owner: "", preferred: "", banned: "", assetName: "" });
+    setFile(null);
+    setError("");
+    setSuccess("");
+  }, [activeBrandId]);
+
   async function save(event: FormEvent) {
     event.preventDefault(); setError(""); setSuccess("");
     try {
@@ -188,20 +198,25 @@ function Knowledge() {
       else if (tab === "facts") await api.createFact({ text: draft.fact, owner: draft.owner });
       else if (tab === "terms") await api.createTerm({ preferred: draft.preferred, banned: draft.banned });
       else if (file) await api.uploadAsset(file, draft.assetName || file.name);
-      setSuccess("Saved to this organisation’s knowledge base."); setFile(null); setOpen(false);
+      setSuccess(activeBrand ? `Saved to the ${activeBrand.name} workspace.` : "Saved as organisation-wide shared knowledge."); setFile(null); setOpen(false);
       await Promise.all([rules.refetch(), facts.refetch(), terms.refetch(), assets.refetch()]);
     } catch (cause) { setError(errText(cause)); }
   }
   const collections = { guidelines: rules, facts, terms, assets };
   const current = collections[tab as keyof typeof collections];
   const rows = current.data ?? [];
+  const scopeLabel = (entry: Rule | Fact | Term | Asset) => {
+    if (!entry.brand_id) return "Organisation-wide shared";
+    const brandName = brands.find(brand => brand.id === entry.brand_id)?.name;
+    return `Brand-specific · ${brandName ?? "Archived or unavailable brand"}`;
+  };
   const filtered = rows.filter((entry: Rule | Fact | Term | Asset) => JSON.stringify(entry).toLowerCase().includes(search.toLowerCase()))
     .filter((entry: Rule | Fact | Term | Asset) => !approvalFilter || ("status" in entry && entry.status === approvalFilter));
   return <div className="product-page"><PageHeading title="Brand knowledge" description="Manage the approved sources that inform every review." action={<Button variant="primary" onClick={() => setOpen(true)}>Add {tab === "guidelines" ? "guidance" : tab.slice(0, -1)}</Button>} />
     {success && <p role="status" className="ok">{success}</p>}{error && <p role="alert" className="alert error">{error}</p>}
     <div className="product-tabs" role="tablist" aria-label="Knowledge categories">{["guidelines", "facts", "terms", "assets"].map(value => <button key={value} role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>{value[0].toUpperCase() + value.slice(1)}</button>)}</div>
     <Card title={`${tab[0].toUpperCase()}${tab.slice(1)} (${filtered.length})`}><div className="product-filters"><Input label={`Search ${tab}`} value={search} onChange={event => setSearch(event.target.value)} placeholder="Search knowledge" /><Select label="Approval status" value={approvalFilter} onChange={event => setApprovalFilter(event.target.value)} options={[{ value: "", label: "All statuses" }, { value: "approved", label: "Approved" }, { value: "pending", label: "Pending" }, { value: "draft", label: "Draft" }]} /></div>
-      <QueryState loading={current.isPending} error={current.error} empty={!filtered.length}>{filtered.map((entry: Rule | Fact | Term | Asset) => <article className="product-list-row" key={entry.id}><span><strong>{"text" in entry ? entry.text : "preferred" in entry ? `${entry.preferred} / ${entry.banned}` : entry.name ?? ("clause_number" in entry ? entry.clause_number : entry.id)}</strong><small>{"status" in entry ? entry.status : "Approved source"}</small></span>{"status" in entry && entry.status !== "approved" && "clause_number" in entry && <Button size="sm" onClick={async () => { try { await api.updateRule(entry.id, { status: "approved" }); await rules.refetch(); } catch (cause) { setError(errText(cause)); } }}>Approve</Button>}</article>)}</QueryState>
+      <QueryState loading={current.isPending} error={current.error} empty={!filtered.length}>{filtered.map((entry: Rule | Fact | Term | Asset) => <article className="product-list-row" key={entry.id}><span><strong>{"text" in entry ? entry.text : "preferred" in entry ? `${entry.preferred} / ${entry.banned}` : entry.name ?? ("clause_number" in entry ? entry.clause_number : entry.id)}</strong><small>{"status" in entry ? entry.status : "Approved source"} · {scopeLabel(entry)}</small></span>{"status" in entry && entry.status !== "approved" && "clause_number" in entry && <Button size="sm" onClick={async () => { try { await api.updateRule(entry.id, { status: "approved" }); await rules.refetch(); } catch (cause) { setError(errText(cause)); } }}>Approve</Button>}</article>)}</QueryState>
     </Card>
     <Dialog open={open} onClose={() => setOpen(false)} title={`Add ${tab === "guidelines" ? "guidance" : tab.slice(0, -1)}`}><form className="product-form" onSubmit={save}>
       {tab === "guidelines" && <><Input label="Clause number" value={draft.clause_number} onChange={event => setDraft({ ...draft, clause_number: event.target.value })} /><Textarea label="Guideline text" value={draft.text} onChange={event => setDraft({ ...draft, text: event.target.value })} /><label>Or upload a guideline file<input type="file" accept=".txt,.md,.csv,.docx,.pdf" onChange={event => setFile(event.target.files?.[0] ?? null)} /></label></>}
@@ -215,7 +230,8 @@ function Knowledge() {
 
 function AuditLog() {
   const user = useUser();
-  const items = useQuery({ queryKey: ["content-list", user.organisation_id], queryFn: api.contentList });
+  const { activeBrandId } = useBrand();
+  const items = useQuery({ queryKey: ["content-list", user.organisation_id, activeBrandId], queryFn: api.contentList });
   const [rows, setRows] = useState<{ id: string; action: string; details: string | null; created_at: string; title: string }[]>([]);
   const [error, setError] = useState("");
   const [auditLoading, setAuditLoading] = useState(false);
@@ -240,7 +256,7 @@ function AuditLog() {
 }
 
 function Notifications() {
-  const user = useUser(); const queue = useQuery({ queryKey: ["review-queue", user.organisation_id], queryFn: api.queue, enabled: user.role !== "creator" }); const drift = useQuery({ queryKey: ["fact-drift", user.organisation_id], queryFn: api.drift });
+  const user = useUser(); const { activeBrandId } = useBrand(); const queue = useQuery({ queryKey: ["review-queue", user.organisation_id, activeBrandId], queryFn: api.queue, enabled: user.role !== "creator" }); const drift = useQuery({ queryKey: ["fact-drift", user.organisation_id], queryFn: api.drift });
   return <div className="product-page"><PageHeading title="Notifications" description="Review work and approved facts that may need attention." />
     <Card title="Review queue"><QueryState loading={user.role !== "creator" && queue.isPending} error={queue.error} empty={!queue.data?.length}>{(queue.data ?? []).map(item => <Link className="product-list-row" href={`/queue/${item.id}`} key={item.id}><span>{item.title || "Untitled submission"}</span><Status value={item.status} /></Link>)}</QueryState></Card>
     <Card title="Fact drift"><QueryState loading={drift.isPending} error={drift.error} empty={!drift.data?.length}>{(drift.data ?? []).map(alert => <Link className="product-list-row" href="/insights" key={alert.id}><span>Fact changed for content {alert.ref_id.slice(0, 8)}</span><time>{new Date(alert.created_at).toLocaleString()}</time></Link>)}</QueryState></Card>

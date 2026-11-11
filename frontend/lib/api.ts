@@ -6,25 +6,43 @@ export const CONNECTION_RESTORED_EVENT = "brandwright:connection-restored";
 
 export type Role = "creator" | "manager" | "reviewer" | "admin";
 export type DemoRole = Extract<Role, "creator" | "reviewer" | "admin">;
-export type User = { id: string; email: string; role: Role; organisation_id: string };
+export type User = { id: string; email: string; role: Role; organisation_id: string; jury_demo?: boolean };
+export type Brand = {
+  id: string;
+  name: string;
+  description?: string | null;
+  industry?: string | null;
+  website_url?: string | null;
+  logo_url?: string | null;
+  primary_colour?: string | null;
+  secondary_colour?: string | null;
+  voice?: string | null;
+  target_audience?: string | null;
+  mission?: string | null;
+  vision?: string | null;
+  guidelines?: string | null;
+  status: "active" | "archived";
+  created_at: string;
+  updated_at: string;
+};
 export type Content = {
-  id: string; title: string | null; current_version_no: number; status: string; created_at?: string; creator_id?: string;
+  id: string; title: string | null; current_version_no: number; status: string; created_at?: string; creator_id?: string; brand_id?: string | null;
 };
 export type ContentDetail = Content & {
   body: string; intent: string; channel: string;
   versions: { version_no: number; body: string; intent: string; created_at: string }[];
 };
 export type Rule = {
-  id: string; clause_number: string; text: string; category: string;
+  id: string; brand_id?: string | null; clause_number: string; text: string; category: string;
   channels?: string[]; type?: string | null; config?: Record<string, unknown> | null;
   status: string; version: number;
 };
 export type Fact = {
-  id: string; text: string; owner?: string | null; source_url?: string | null;
+  id: string; brand_id?: string | null; text: string; owner?: string | null; source_url?: string | null;
   expires_at?: string | null; status: string; version: number;
 };
-export type Term = { id: string; preferred: string; banned: string; notes?: string | null };
-export type Asset = { id: string; name: string; file_url: string; metadata_json?: string | null };
+export type Term = { id: string; brand_id?: string | null; preferred: string; banned: string; notes?: string | null };
+export type Asset = { id: string; brand_id?: string | null; name: string; file_url: string; metadata_json?: string | null };
 export type RuleDraftUpload = { id: string; title: string; rules: Rule[]; extraction_warnings?: string[] };
 export type Clarification = {
   id: string; rule_id: string; current_text: string; drafted_text: string;
@@ -157,6 +175,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = tk.get();
   const headers = new Headers(init.headers);
   const isForm = typeof FormData !== "undefined" && init.body instanceof FormData;
+  const activeBrandId = typeof window !== "undefined" ? window.localStorage.getItem("bw_active_brand_id") : null;
+  const isBrandScoped = path.startsWith("/kb/")
+    || path === "/content"
+    || path === "/content/upload"
+    || path === "/queue";
+  const hasExplicitBrand = new URLSearchParams(path.split("?")[1] ?? "").has("brand_id");
+  if (activeBrandId && isBrandScoped && !hasExplicitBrand) {
+    const separator = path.includes("?") ? "&" : "?";
+    path = `${path}${separator}brand_id=${encodeURIComponent(activeBrandId)}`;
+  }
   if (init.body && !isForm && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
   let response: Response;
@@ -280,29 +308,73 @@ export const api = {
       body: JSON.stringify({ role }),
       signal: AbortSignal.timeout(15_000),
     }),
+  juryDemoLogin: () =>
+    request<{ access_token: string; token_type: string }>("/auth/jury-demo-login", {
+      method: "POST",
+      signal: AbortSignal.timeout(15_000),
+    }),
+  jurySwitchRole: (role: DemoRole) =>
+    post<{ access_token: string; token_type: string }>("/auth/jury-switch-role", { role }),
   me: () => get<User>("/auth/me"),
-  rules: () => get<Rule[]>("/kb/rules"),
-  facts: () => get<Fact[]>("/kb/facts"),
-  terms: () => get<Term[]>("/kb/terms"),
-  uploadGuideline: (file: File) => {
+  brands: (q = "", includeArchived = false) => {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (includeArchived) params.set("include_archived", "true");
+    const query = params.toString();
+    return get<Brand[]>(`/brands${query ? `?${query}` : ""}`);
+  },
+  brand: (id: string) => get<Brand>(`/brands/${id}`),
+  createBrand: (brand: Omit<Brand, "id" | "logo_url" | "status" | "created_at" | "updated_at">) =>
+    post<Brand>("/brands", brand),
+  updateBrand: (id: string, patch: Partial<Omit<Brand, "id" | "logo_url" | "status" | "created_at" | "updated_at">>) =>
+    request<Brand>(`/brands/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  archiveBrand: (id: string) => post<Brand>(`/brands/${id}/archive`),
+  uploadBrandLogo: (id: string, file: File) => {
     const form = new FormData();
     form.set("file", file);
-    return request<RuleDraftUpload>("/kb/guidelines", { method: "POST", body: form });
+    return request<Brand>(`/brands/${id}/logo`, { method: "POST", body: form });
+  },
+  brandLogo: async (id: string): Promise<Blob> => {
+    const token = tk.get();
+    const response = await fetch(`${API_BASE}/brands/${encodeURIComponent(id)}/logo`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      if (response.status === 401 && token) notifyUnauthorized();
+      let detail = response.statusText;
+      try {
+        const payload = await response.json();
+        detail = messageFromDetail(payload?.detail ?? payload?.message ?? detail);
+      } catch { /* response did not contain JSON */ }
+      throw new ApiError(response.status, detail, response.headers.get("X-Request-ID") ?? undefined);
+    }
+    return response.blob();
+  },
+  rules: (brandId?: string) => get<Rule[]>(brandId ? `/kb/rules?brand_id=${encodeURIComponent(brandId)}` : "/kb/rules"),
+  facts: (brandId?: string) => get<Fact[]>(brandId ? `/kb/facts?brand_id=${encodeURIComponent(brandId)}` : "/kb/facts"),
+  terms: (brandId?: string) => get<Term[]>(brandId ? `/kb/terms?brand_id=${encodeURIComponent(brandId)}` : "/kb/terms"),
+  uploadGuideline: (file: File, brandId?: string) => {
+    const form = new FormData();
+    form.set("file", file);
+    const query = brandId ? `?brand_id=${encodeURIComponent(brandId)}` : "";
+    return request<RuleDraftUpload>(`/kb/guidelines${query}`, { method: "POST", body: form });
   },
   updateRule: (id: string, patch: Partial<Rule>) =>
     request<Rule>(`/kb/rules/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
-  createRule: (rule: Pick<Rule, "clause_number" | "text" | "category"> & Partial<Pick<Rule, "channels">>) =>
-    post<Rule>("/kb/rules", rule),
-  createFact: (fact: Pick<Fact, "text"> & Partial<Pick<Fact, "owner" | "source_url" | "expires_at">>) =>
-    post<Fact>("/kb/facts", fact),
-  createTerm: (term: Pick<Term, "preferred" | "banned"> & Partial<Pick<Term, "notes">>) =>
-    post<Term>("/kb/terms", term),
-  assets: () => get<Asset[]>("/kb/assets"),
-  uploadAsset: (file: File, name: string) => {
+  createRule: (rule: Pick<Rule, "clause_number" | "text" | "category"> & Partial<Pick<Rule, "channels">>, brandId?: string) =>
+    post<Rule>(`/kb/rules${brandId ? `?brand_id=${encodeURIComponent(brandId)}` : ""}`, rule),
+  createFact: (fact: Pick<Fact, "text"> & Partial<Pick<Fact, "owner" | "source_url" | "expires_at">>, brandId?: string) =>
+    post<Fact>(`/kb/facts${brandId ? `?brand_id=${encodeURIComponent(brandId)}` : ""}`, fact),
+  createTerm: (term: Pick<Term, "preferred" | "banned"> & Partial<Pick<Term, "notes">>, brandId?: string) =>
+    post<Term>(`/kb/terms${brandId ? `?brand_id=${encodeURIComponent(brandId)}` : ""}`, term),
+  assets: (brandId?: string) => get<Asset[]>(brandId ? `/kb/assets?brand_id=${encodeURIComponent(brandId)}` : "/kb/assets"),
+  uploadAsset: (file: File, name: string, brandId?: string) => {
     const form = new FormData();
     form.set("file", file);
     form.set("name", name);
-    return request<Asset>("/kb/assets/upload", { method: "POST", body: form });
+    const query = brandId ? `?brand_id=${encodeURIComponent(brandId)}` : "";
+    return request<Asset>(`/kb/assets/upload${query}`, { method: "POST", body: form });
   },
   contentList: () => get<Content[]>("/content"),
   createContent: (title: string, body: string, intent: string, channel: string) =>

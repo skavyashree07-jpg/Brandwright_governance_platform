@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Text, DateTime, Boolean, ForeignKey, Float, Integer, JSON
+from sqlalchemy import Column, String, Text, DateTime, Boolean, ForeignKey, Float, Integer, JSON, Index, text as sql_text
 from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
@@ -19,6 +19,37 @@ class Organisation(Base):
     assets = relationship("Asset", back_populates="organisation")
     content_items = relationship("ContentItem", back_populates="organisation")
 
+
+class Brand(Base):
+    __tablename__ = "brands"
+    __table_args__ = (
+        Index(
+            "uq_brands_organisation_name_lower",
+            "organisation_id",
+            sql_text("lower(name)"),
+            unique=True,
+        ),
+        Index("ix_brands_organisation_status", "organisation_id", "status"),
+    )
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    name = Column(String(160), nullable=False)
+    description = Column(Text, nullable=True)
+    industry = Column(String(120), nullable=True)
+    website_url = Column(String(2048), nullable=True)
+    logo_file_key = Column(Text, nullable=True)
+    primary_colour = Column(String(7), nullable=True)
+    secondary_colour = Column(String(7), nullable=True)
+    voice = Column(String(120), nullable=True)
+    target_audience = Column(Text, nullable=True)
+    mission = Column(Text, nullable=True)
+    vision = Column(Text, nullable=True)
+    guidelines = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class User(Base):
     __tablename__ = "users"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -34,6 +65,7 @@ class GuidelineDoc(Base):
     __tablename__ = "guideline_docs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=True, index=True)
     title = Column(String, nullable=False)
     file_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -45,6 +77,7 @@ class Rule(Base):
     __tablename__ = "rules"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=True, index=True)
     guideline_id = Column(UUID(as_uuid=True), ForeignKey("guideline_docs.id"), nullable=True)
     clause_number = Column(String, nullable=False)
     text = Column(Text, nullable=False)
@@ -64,6 +97,7 @@ class Fact(Base):
     __tablename__ = "facts"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=True, index=True)
     text = Column(Text, nullable=False)
     owner = Column(String, nullable=True)
     source_url = Column(String, nullable=True)
@@ -79,6 +113,7 @@ class Term(Base):
     __tablename__ = "terms"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=True, index=True)
     preferred = Column(String, nullable=False)
     banned = Column(String, nullable=False)
     notes = Column(Text, nullable=True)
@@ -91,6 +126,7 @@ class Asset(Base):
     __tablename__ = "assets"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=True, index=True)
     name = Column(String, nullable=False)
     file_url = Column(String, nullable=False)
     metadata_json = Column(Text, nullable=True)
@@ -102,6 +138,7 @@ class ContentItem(Base):
     __tablename__ = "content_items"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organisation_id = Column(UUID(as_uuid=True), ForeignKey("organisations.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=True, index=True)
     creator_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=True)
     current_version_no = Column(Integer, default=1)

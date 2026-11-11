@@ -6,6 +6,7 @@ import Queue from "./page";
 
 vi.mock("@/components/Shell", () => ({
   useUser: () => ({ id: "reviewer-1", email: "reviewer@brandwright.test", role: "reviewer", organisation_id: "org-1" }),
+  useBrand: () => ({ activeBrandId: null }),
 }));
 
 vi.mock("@/lib/kb", () => ({ useSourceLabel: () => () => null }));

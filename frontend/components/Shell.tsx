@@ -10,14 +10,26 @@ import {
 } from "lucide-react";
 import { motion, useReducedMotion } from "framer-motion";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError, CONNECTION_LOST_EVENT, CONNECTION_RESTORED_EVENT, tk, UNAUTHORIZED_EVENT, User, Role } from "@/lib/api";
+import { api, ApiError, Brand, CONNECTION_LOST_EVENT, CONNECTION_RESTORED_EVENT, tk, UNAUTHORIZED_EVENT, User, Role, DemoRole, errText } from "@/lib/api";
 import { Badge, Button, CommandPalette, CommandPaletteItem, Dialog, Drawer } from "@/components/ui";
 
 const UserContext = createContext<User | null>(null);
+type BrandContextValue = {
+  activeBrand: Brand | null;
+  activeBrandId: string | null;
+  brands: Brand[];
+  setActiveBrand: (brandId: string | null) => void;
+};
+const BrandContext = createContext<BrandContextValue | null>(null);
 export const useUser = () => {
   const user = useContext(UserContext);
   if (!user) throw new Error("useUser must be used inside the authenticated application shell.");
   return user;
+};
+export const useBrand = () => {
+  const context = useContext(BrandContext);
+  if (!context) throw new Error("useBrand must be used inside the authenticated application shell.");
+  return context;
 };
 
 type ThemeMode = "system" | "light" | "dark" | "high-contrast";
@@ -41,6 +53,7 @@ const NAVIGATION_GROUPS: { label: string; items: NavigationItem[] }[] = [
     { href: "/brand-knowledge", label: "Brand knowledge", description: "Guidelines, facts and assets", roles: ["manager", "admin"], icon: FileText },
   ] },
   { label: "Administration", items: [
+    { href: "/brands", label: "Brand management", description: "Create and manage brands", roles: ["admin"], icon: Building2 },
     { href: "/audit-log", label: "Audit log", description: "Organisation activity", roles: ["manager", "admin"], icon: FileClock },
     { href: "/team", label: "Team", description: "Members and roles", roles: ["manager", "admin"], icon: Users },
     { href: "/settings", label: "Settings", description: "Organisation preferences", roles: ["manager", "admin"], icon: Settings2 },
@@ -88,20 +101,50 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const [tourStorageError, setTourStorageError] = useState("");
   const [offline, setOffline] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [switchingRole, setSwitchingRole] = useState(false);
+  const [roleSwitchError, setRoleSwitchError] = useState("");
   const [theme, setTheme] = useState<ThemeMode>("system");
   const [themeReady, setThemeReady] = useState(false);
+  const [activeBrandId, setActiveBrandId] = useState<string | null>(null);
+  const brandsQuery = useQuery({
+    queryKey: ["brands", user?.organisation_id],
+    queryFn: () => api.brands(),
+    enabled: !!user,
+  });
+  const brands = brandsQuery.data ?? [];
+  const activeBrand = brands.find(brand => brand.id === activeBrandId) ?? null;
 
   const { data: queueItems = [] } = useQuery({
-    queryKey: ["shell-queue-count", user?.organisation_id],
+    queryKey: ["shell-queue-count", user?.organisation_id, activeBrandId],
     queryFn: api.queue,
     enabled: !!user && ["reviewer", "manager", "admin"].includes(user.role),
     refetchInterval: 30_000,
   });
   const queueCount = queueItems.length;
-  const commandContent = useQuery({ queryKey: ["command-content", user?.organisation_id], queryFn: api.contentList, enabled: commandOpen && user?.role === "creator" });
-  const commandQueue = useQuery({ queryKey: ["command-queue", user?.organisation_id], queryFn: api.queue, enabled: commandOpen && !!user && ["reviewer", "manager", "admin"].includes(user.role) });
-  const commandRules = useQuery({ queryKey: ["command-rules", user?.organisation_id], queryFn: api.rules, enabled: commandOpen && !!user });
-  const commandFacts = useQuery({ queryKey: ["command-facts", user?.organisation_id], queryFn: api.facts, enabled: commandOpen && !!user });
+  const commandContent = useQuery({ queryKey: ["command-content", user?.organisation_id, activeBrandId], queryFn: api.contentList, enabled: commandOpen && user?.role === "creator" });
+  const commandQueue = useQuery({ queryKey: ["command-queue", user?.organisation_id, activeBrandId], queryFn: api.queue, enabled: commandOpen && !!user && ["reviewer", "manager", "admin"].includes(user.role) });
+  const commandRules = useQuery({ queryKey: ["command-rules", user?.organisation_id, activeBrandId], queryFn: () => api.rules(), enabled: commandOpen && !!user });
+  const commandFacts = useQuery({ queryKey: ["command-facts", user?.organisation_id, activeBrandId], queryFn: () => api.facts(), enabled: commandOpen && !!user });
+
+  useEffect(() => {
+    if (!user || !brandsQuery.data) return;
+    const preferenceKey = `bw_active_brand:${user.organisation_id}:${user.id}`;
+    const saved = localStorage.getItem(preferenceKey);
+    const selected = saved === "all" ? null : brandsQuery.data.find(brand => brand.id === saved) ?? brandsQuery.data[0] ?? null;
+    setActiveBrandId(selected?.id ?? null);
+    if (selected) localStorage.setItem("bw_active_brand_id", selected.id);
+    else localStorage.removeItem("bw_active_brand_id");
+  }, [brandsQuery.data, user]);
+
+  const setActiveBrand = useCallback((brandId: string | null) => {
+    if (!user) return;
+    const selected = brandId ? brands.find(brand => brand.id === brandId) : null;
+    if (brandId && !selected) return;
+    setActiveBrandId(selected?.id ?? null);
+    localStorage.setItem(`bw_active_brand:${user.organisation_id}:${user.id}`, selected?.id ?? "all");
+    if (selected) localStorage.setItem("bw_active_brand_id", selected.id);
+    else localStorage.removeItem("bw_active_brand_id");
+  }, [brands, user]);
 
   useEffect(() => {
     try {
@@ -129,6 +172,26 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
   }, [queryClient, router]);
+  async function switchJuryRole(role: DemoRole) {
+    if (!user?.jury_demo || switchingRole) return;
+    const previousToken = tk.get();
+    setSwitchingRole(true);
+    setRoleSwitchError("");
+    try {
+      const result = await api.jurySwitchRole(role);
+      tk.set(result.access_token);
+      const profile = await api.me();
+      if (!profile.jury_demo) throw new Error("The API did not confirm the jury demo session.");
+      queryClient.clear();
+      setUser(profile);
+      router.replace(role === "creator" ? "/workspace" : role === "reviewer" ? "/queue" : "/insights");
+    } catch (cause) {
+      if (previousToken && !(cause instanceof ApiError && cause.status === 401)) tk.set(previousToken);
+      setRoleSwitchError(errText(cause));
+    } finally {
+      setSwitchingRole(false);
+    }
+  }
 
   useEffect(() => {
     const showOffline = () => setOffline(true);
@@ -284,6 +347,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   </nav>;
 
   return <UserContext.Provider value={user}>
+    <BrandContext.Provider value={{ activeBrand, activeBrandId, brands, setActiveBrand }}>
     <a className="skip-link" href="#main">Skip to content</a>
     <div className={`app-frame ${collapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="app-rail" aria-label="Workspace sidebar">
@@ -298,13 +362,35 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           <div className="rail-session"><ShieldCheck size={14} aria-hidden="true" /><span className="shell-nav-label">Authenticated session</span></div>
           <div className="rail-user">
             <span className="avatar" aria-hidden="true">{user.email.slice(0, 1).toUpperCase()}</span>
-            <span className="rail-user-copy"><strong>{user.email}</strong><small>{user.role}</small></span>
-            <Button className="rail-signout" variant="ghost" onClick={signOut} title="Sign out" aria-label="Sign out"><LogOut size={17} /></Button>
+            <span className="rail-user-copy"><strong>{user.email}</strong><small>{user.jury_demo ? "Jury Demo · " : ""}{user.role}</small></span>
+            <Button className="rail-signout" variant="ghost" onClick={signOut} title={user.jury_demo ? "Exit demo" : "Sign out"} aria-label={user.jury_demo ? "Exit demo" : "Sign out"}><LogOut size={17} /></Button>
           </div>
         </div>
       </aside>
 
       <div className="app-main">
+        {user.jury_demo && <section className="jury-demo-bar" aria-label="Jury demo controls">
+          <div className="jury-demo-status">
+            <ShieldCheck size={17} aria-hidden="true" />
+            <span><strong>Jury Demo Mode</strong><small>Fictional demo organisation · {user.role}</small></span>
+          </div>
+          <label className="jury-role-picker">
+            <span>Explore as</span>
+            <select
+              aria-label="Switch demo role"
+              value={user.role}
+              disabled={switchingRole}
+              onChange={event => void switchJuryRole(event.target.value as DemoRole)}
+            >
+              <option value="admin">Admin</option>
+              <option value="reviewer">Reviewer</option>
+              <option value="creator">Creator</option>
+            </select>
+          </label>
+          {switchingRole && <span className="jury-switching" role="status">Switching role…</span>}
+          {roleSwitchError && <p className="jury-demo-error" role="alert">{roleSwitchError}</p>}
+          <Button variant="secondary" size="sm" onClick={signOut}>Exit Demo</Button>
+        </section>}
         {offline && <div className="connection-banner" role="status"><span>Connection lost. Some information may be out of date.</span><Button variant="secondary" size="sm" loading={retrying} onClick={() => void retryConnection()}>Retry</Button></div>}
         {tourStorageError && <div className="connection-banner" role="status"><span>{tourStorageError}</span><Button variant="ghost" size="sm" onClick={() => setTourStorageError("")}>Dismiss</Button></div>}
         <header className="app-topbar">
@@ -316,6 +402,15 @@ export default function Shell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
           <div className="topbar-actions">
+            {brands.length > 0 && <div className="brand-switcher">
+              <label htmlFor="active-brand">Active brand</label>
+              <select id="active-brand" value={activeBrandId ?? "all"} onChange={event => setActiveBrand(event.target.value === "all" ? null : event.target.value)}>
+                <option value="all">All brands / shared data</option>
+                {brands.map(brand => <option value={brand.id} key={brand.id}>{brand.name}</option>)}
+              </select>
+              {activeBrand && <Link href={`/brands/${activeBrand.id}`} className="brand-view-link">View identity</Link>}
+            </div>}
+            {brandsQuery.isError && <span className="brand-switcher-error" role="status">Brands unavailable</span>}
             <Button className="search-trigger" variant="secondary" onClick={() => setCommandOpen(true)} aria-label="Search K">
               <Search size={16} aria-hidden="true" /><span>Search</span><kbd aria-hidden="true"><Command size={11} /> K</kbd>
             </Button>
@@ -344,7 +439,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
               <div className="shell-menu-panel user-menu-panel">
                 <div className="menu-identity"><strong>{user.email}</strong><span>{user.role}</span></div>
                 <div className="menu-organisation"><Building2 size={15} aria-hidden="true" /><span>Organisation</span><strong>{user.organisation_id}</strong><small>Organisation switching is not available in this API.</small></div>
-                <button onClick={signOut}><LogOut size={15} aria-hidden="true" />Sign out</button>
+                <button onClick={signOut}><LogOut size={15} aria-hidden="true" />{user.jury_demo ? "Exit demo" : "Sign out"}</button>
               </div>
             </details>
           </div>
@@ -370,7 +465,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     </div>
     <Drawer open={mobileOpen} onClose={() => setMobileOpen(false)} title="Workspace navigation">
       <Navigation onNavigate={() => setMobileOpen(false)} />
-      <div className="mobile-drawer-user"><span>{user.email}</span><span>{user.role}</span><Button onClick={signOut} variant="secondary">Sign out</Button></div>
+      <div className="mobile-drawer-user"><span>{user.email}</span><span>{user.jury_demo ? "Jury Demo · " : ""}{user.role}</span><Button onClick={signOut} variant="secondary">{user.jury_demo ? "Exit demo" : "Sign out"}</Button></div>
     </Drawer>
     <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} items={commandItems} loading={commandContent.isFetching || commandQueue.isFetching || commandRules.isFetching || commandFacts.isFetching} error={searchError ? "Some search results could not be loaded. Close and retry, or navigate to the relevant page." : undefined} />
     <Dialog open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} title="Keyboard shortcuts">
@@ -394,5 +489,6 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         </div>
       </div>
     </Dialog>
+    </BrandContext.Provider>
   </UserContext.Provider>;
 }

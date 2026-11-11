@@ -24,6 +24,26 @@ def test_review_state_machine_allows_queue_progress_and_completion():
     validate_review_transition("running", "failed")
 
 
+def test_content_workflow_accepts_human_review_transitions_and_rejects_unsafe_role_access():
+    from fastapi import HTTPException
+
+    from app.workflow import transition_content_status
+
+    content = SimpleNamespace(id=uuid4(), status="draft")
+    db = SimpleNamespace(add=lambda *args, **kwargs: None, flush=lambda: None)
+    transition_content_status(db, content, "submitted", "user-1", "org-1", user_role="creator")
+
+    content.status = "submitted"
+    transition_content_status(db, content, "queued", "user-1", "org-1", user_role="reviewer")
+
+    try:
+        content.status = "queued"
+        transition_content_status(db, content, "approved", "user-1", "org-1", user_role="creator")
+        assert False, "Creator should not be allowed to approve content."
+    except HTTPException:
+        pass
+
+
 def test_review_state_machine_rejects_resuming_terminal_job():
     with pytest.raises(ValueError, match="Illegal review status transition"):
         validate_review_transition("completed", "running")

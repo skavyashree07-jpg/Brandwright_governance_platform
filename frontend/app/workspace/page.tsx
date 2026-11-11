@@ -5,14 +5,15 @@ import { useSourceLabel } from "@/lib/kb";
 import { Annotated } from "@/components/Annotated";
 import { ReviewProgress } from "@/components/ReviewProgress";
 import { Button, DiffViewer, Drawer, FileDropzone, Tooltip } from "@/components/ui";
-import { useUser } from "@/components/Shell";
+import { useBrand, useUser } from "@/components/Shell";
 import { FileCheck2 } from "lucide-react";
 
 const CHANNELS = ["general", "LinkedIn", "Email", "Website", "Press"];
 
 export default function Workspace() {
   const user = useUser();
-  const draftStorageKey = `bw_workspace_draft:${user.organisation_id}:${user.id}`;
+  const { activeBrand, activeBrandId } = useBrand();
+  const draftStorageKey = `bw_workspace_draft:${user.organisation_id}:${user.id}:${activeBrandId ?? "all"}`;
   const [f, setF] = useState({ title: "", intent: "", channel: "general", body: "" });
   const [draftRestored, setDraftRestored] = useState(false);
   const [draftSaveState, setDraftSaveState] = useState<"saved" | "saving" | "error">("saved");
@@ -40,6 +41,30 @@ export default function Workspace() {
   const stale = !!reviewed && (f.body !== reviewed.body || f.intent !== reviewed.intent);
   const locked = !!c && !["draft", "changes_requested"].includes(c.status);
   const frozen = busy || locked || stale;
+
+  useEffect(() => {
+    setDraftRestored(false);
+    setF({ title: "", intent: "", channel: "general", body: "" });
+    setUpload(null);
+    setUploadWarnings([]);
+    setAltText("");
+    setC(null);
+    setFs([]);
+    setReviewed(null);
+    setEngine(null);
+    setAiServices([]);
+    setReviewProgress(null);
+    setDis(null);
+    setReason("");
+    setEditing(null);
+    setOn(null);
+    setErr("");
+    setMsg("");
+    setVersionHistory([]);
+    setVersionError("");
+    setVersionDrawerOpen(false);
+    setPreviewRewriteId(null);
+  }, [draftStorageKey]);
 
   useEffect(() => {
     try {
@@ -302,6 +327,7 @@ export default function Workspace() {
         <div>
           <div className="section-tag">CREATOR WORKSPACE</div>
           <h1>Check a draft</h1>
+          <p className="mu">{activeBrand ? `Reviewing for ${activeBrand.name}.` : "No single brand is active; this review will use organisation-wide shared guidance."}</p>
           <p className="mu">Compare your content with approved guidance before sending it for review.</p>
         </div>
         <div className="workspace-heading-actions">

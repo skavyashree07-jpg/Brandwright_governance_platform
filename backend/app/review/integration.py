@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -24,12 +25,16 @@ from app.review.pipeline import review_text
 from app.review.pgvector_retrieval import PgVectorRetriever
 
 
-def _rule_sources(db: Session, organisation_id: UUID) -> list[dict[str, Any]]:
+def _rule_sources(db: Session, organisation_id: UUID, brand_id: UUID | None = None) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
-    for rule in db.query(Rule).filter(
+    rule_query = db.query(Rule).filter(
         Rule.organisation_id == organisation_id,
         Rule.status == "approved",
-    ):
+    )
+    term_query = db.query(Term).filter(Term.organisation_id == organisation_id)
+    rule_query = rule_query.filter(or_(Rule.brand_id.is_(None), Rule.brand_id == brand_id))
+    term_query = term_query.filter(or_(Term.brand_id.is_(None), Term.brand_id == brand_id))
+    for rule in rule_query:
         sources.append({
             "id": str(rule.id),
             "source_type": "rule",
@@ -42,7 +47,7 @@ def _rule_sources(db: Session, organisation_id: UUID) -> list[dict[str, Any]]:
             "config": rule.config or {},
         })
 
-    for term in db.query(Term).filter(Term.organisation_id == organisation_id):
+    for term in term_query:
         sources.append({
             "id": str(term.id),
             "source_type": "rule",
@@ -56,7 +61,13 @@ def _rule_sources(db: Session, organisation_id: UUID) -> list[dict[str, Any]]:
     return sources
 
 
-def _fact_sources(db: Session, organisation_id: UUID) -> list[dict[str, Any]]:
+def _fact_sources(db: Session, organisation_id: UUID, brand_id: UUID | None = None) -> list[dict[str, Any]]:
+    query = db.query(Fact).filter(
+        Fact.organisation_id == organisation_id,
+        Fact.status == "approved",
+        (Fact.expires_at.is_(None)) | (Fact.expires_at > datetime.utcnow()),
+    )
+    query = query.filter(or_(Fact.brand_id.is_(None), Fact.brand_id == brand_id))
     return [
         {
             "id": str(fact.id),
@@ -66,11 +77,7 @@ def _fact_sources(db: Session, organisation_id: UUID) -> list[dict[str, Any]]:
             "expires_at": fact.expires_at.isoformat() if fact.expires_at else None,
             "sensitivity": "normal",
         }
-        for fact in db.query(Fact).filter(
-            Fact.organisation_id == organisation_id,
-            Fact.status == "approved",
-            (Fact.expires_at.is_(None)) | (Fact.expires_at > datetime.utcnow()),
-        )
+        for fact in query
     ]
 
 
@@ -79,6 +86,7 @@ def _source_is_valid(
     organisation_id: UUID,
     source_type: str | None,
     source_id: UUID | None,
+    brand_id: UUID | None = None,
 ) -> tuple[bool, str]:
     if source_id is None:
         return False, ""
@@ -87,12 +95,14 @@ def _source_is_valid(
             Rule.id == source_id,
             Rule.organisation_id == organisation_id,
             Rule.status == "approved",
+            or_(Rule.brand_id.is_(None), Rule.brand_id == brand_id),
         ).first()
         if rule:
             return True, rule.text
         term = db.query(Term).filter(
             Term.id == source_id,
             Term.organisation_id == organisation_id,
+            or_(Term.brand_id.is_(None), Term.brand_id == brand_id),
         ).first()
         if term:
             return True, term.notes or f"Use “{term.preferred}” instead of “{term.banned}”."
@@ -102,6 +112,7 @@ def _source_is_valid(
             Fact.organisation_id == organisation_id,
             Fact.status == "approved",
             (Fact.expires_at.is_(None)) | (Fact.expires_at > datetime.utcnow()),
+            or_(Fact.brand_id.is_(None), Fact.brand_id == brand_id),
         ).first()
         if fact:
             return True, fact.text
@@ -109,16 +120,23 @@ def _source_is_valid(
         asset = db.query(Asset).filter(
             Asset.id == source_id,
             Asset.organisation_id == organisation_id,
+            or_(Asset.brand_id.is_(None), Asset.brand_id == brand_id),
         ).first()
         if asset:
             return True, asset.name
     return False, ""
 
 
-def serialize_finding(db: Session, row: Finding, version: ContentVersion, organisation_id: UUID) -> dict[str, Any]:
+def serialize_finding(
+    db: Session,
+    row: Finding,
+    version: ContentVersion,
+    organisation_id: UUID,
+    brand_id: UUID | None = None,
+) -> dict[str, Any]:
     source_type = row.source_type
     source_id = row.source_id
-    valid_source, clause_text = _source_is_valid(db, organisation_id, source_type, source_id)
+    valid_source, clause_text = _source_is_valid(db, organisation_id, source_type, source_id, brand_id)
     status = row.status
     if status == "violation" and not valid_source:
         status = "cannot_verify"
@@ -189,7 +207,7 @@ def run_and_persist_review(
     if version.status == "reviewed" and content.status != "needs_recheck":
         usage_rows = db.query(AIUsageLog).filter(AIUsageLog.content_version_id == version.id).all()
         return {
-            "findings": [serialize_finding(db, row, version, user.organisation_id) for row in existing_rows],
+            "findings": [serialize_finding(db, row, version, user.organisation_id, content.brand_id) for row in existing_rows],
             "engine_status": "degraded" if any(item.blocked for item in usage_rows) else "ok",
             "ai_services_used": list(dict.fromkeys(item.service for item in usage_rows)),
             "cached": True,
@@ -209,11 +227,11 @@ def run_and_persist_review(
         for row in existing_rows
     }
 
-    rules = _rule_sources(db, user.organisation_id)
-    facts = _fact_sources(db, user.organisation_id)
+    rules = _rule_sources(db, user.organisation_id, content.brand_id)
+    facts = _fact_sources(db, user.organisation_id, content.brand_id)
     retriever_mode = settings.RETRIEVER.strip().casefold()
     if retriever_mode == "pgvector":
-        retriever = PgVectorRetriever(db, user.organisation_id)
+        retriever = PgVectorRetriever(db, user.organisation_id, brand_id=content.brand_id)
     elif retriever_mode == "memory":
         retriever = None
     else:
@@ -321,7 +339,7 @@ def run_and_persist_review(
     rows = db.query(Finding).filter(Finding.content_version_id == version.id).all()
     engine_status = "degraded" if any(item.get("blocked") for item in result.get("ai_usage", [])) else "ok"
     return {
-        "findings": [serialize_finding(db, row, version, user.organisation_id) for row in rows],
+        "findings": [serialize_finding(db, row, version, user.organisation_id, content.brand_id) for row in rows],
         "engine_status": engine_status,
         "ai_services_used": result.get("ai_services_used", []),
         "ai_skipped_reason": result.get("ai_skipped_reason"),

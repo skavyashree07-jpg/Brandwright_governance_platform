@@ -1,12 +1,21 @@
 import re
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
 
 def redact_sensitive_data(text: str) -> str:
-    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
-    phone_pattern = r'(?:\+\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}'
-    
-    redacted = re.sub(email_pattern, "[REDACTED_EMAIL]", text)
-    redacted = re.sub(phone_pattern, "[REDACTED_PHONE]", redacted)
+    if not text:
+        return text
+
+    patterns = [
+        (r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[REDACTED_EMAIL]"),
+        (r"(?:\+\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})", "[REDACTED_PHONE]"),
+        (r"\b(?:\d{4}[ -]?){2}\d{4}\b", "[REDACTED_ID]"),
+        (r"\b(?:sk|pk|api|key)[_-][A-Za-z0-9_-]{12,}\b", "[REDACTED_KEY]"),
+    ]
+
+    redacted = text
+    for pattern, replacement in patterns:
+        redacted = re.sub(pattern, replacement, redacted, flags=re.I)
     return redacted
 
 class MockLLMClient:

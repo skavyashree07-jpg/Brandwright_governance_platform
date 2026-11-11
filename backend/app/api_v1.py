@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import threading
@@ -13,7 +14,8 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from redis.exceptions import RedisError
-from sqlalchemy import func
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from fastapi.responses import StreamingResponse
 from redis import Redis
@@ -27,6 +29,7 @@ from app.models import (
     Alert,
     Asset,
     AuditLog,
+    Brand,
     Comment,
     ContentItem,
     ContentVersion,
@@ -56,17 +59,22 @@ from app.review.schemas import Finding as EngineFinding, TextSpan
 from app.review.visual_checks import inspect_image
 from app.schemas import (
     AssetCreateSchema,
+    BrandCreateSchema,
+    BrandSchema,
+    BrandUpdateSchema,
     ClarificationUpdateSchema,
     CommentCreateSchema,
     ContentCreateSchema,
     ContentVersionCreateSchema,
     DemoLoginSchema,
     FactCreateSchema,
+    FactSchema,
     FactUpdateSchema,
     FindingDecisionCreateSchema,
     LoginSchema,
     RuleCreateSchema,
     TermCreateSchema,
+    TermSchema,
     TokenSchema,
     UserSchema,
 )
@@ -80,7 +88,7 @@ from app.security import (
 )
 from app.storage import StorageUnavailable, read_file, store_file
 from app.trust.evaluator import evaluate_dataset
-from app.workflow import transition_content_status, trigger_fact_drift_alerts
+from app.workflow import ensure_version_history_is_immutable, transition_content_status, trigger_fact_drift_alerts
 from app.workers import enqueue_review
 
 api_router = APIRouter(prefix="/api/v1")
@@ -218,6 +226,53 @@ def _latest_version(db: Session, content: ContentItem) -> ContentVersion:
     return version
 
 
+def _brand_or_404(
+    db: Session,
+    brand_id: UUID,
+    user: User,
+    *,
+    active_only: bool = True,
+) -> Brand:
+    query = db.query(Brand).filter(
+        Brand.id == brand_id,
+        Brand.organisation_id == user.organisation_id,
+    )
+    if active_only:
+        query = query.filter(Brand.status == "active")
+    brand = query.first()
+    if brand is None:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    return brand
+
+
+def _brand_payload(brand: Brand) -> dict[str, Any]:
+    return {
+        "id": brand.id,
+        "name": brand.name,
+        "description": brand.description,
+        "industry": brand.industry,
+        "website_url": brand.website_url,
+        "logo_url": f"/brands/{brand.id}/logo" if brand.logo_file_key else None,
+        "primary_colour": brand.primary_colour,
+        "secondary_colour": brand.secondary_colour,
+        "voice": brand.voice,
+        "target_audience": brand.target_audience,
+        "mission": brand.mission,
+        "vision": brand.vision,
+        "guidelines": brand.guidelines,
+        "status": brand.status,
+        "created_at": brand.created_at,
+        "updated_at": brand.updated_at,
+    }
+
+
+def _validate_brand_scope(db: Session, brand_id: UUID | None, user: User) -> UUID | None:
+    if brand_id is None:
+        return None
+    _brand_or_404(db, brand_id, user)
+    return brand_id
+
+
 def _content_payload(db: Session, content: ContentItem) -> dict[str, Any]:
     versions = (
         db.query(ContentVersion)
@@ -231,6 +286,7 @@ def _content_payload(db: Session, content: ContentItem) -> dict[str, Any]:
         "title": content.title,
         "current_version_no": content.current_version_no,
         "status": content.status,
+        "brand_id": str(content.brand_id) if content.brand_id else None,
         "created_at": content.created_at,
         "body": current.body if current else "",
         "intent": current.intent if current else "",
@@ -253,6 +309,7 @@ def _content_payload(db: Session, content: ContentItem) -> dict[str, Any]:
 def _rule_schema(rule: Rule) -> dict[str, Any]:
     return {
         "id": str(rule.id),
+        "brand_id": str(rule.brand_id) if rule.brand_id else None,
         "clause_number": rule.clause_number,
         "text": rule.text,
         "category": rule.category,
@@ -272,6 +329,7 @@ def _make_image_findings(
     version_no: int,
     image_bytes: bytes,
     alt_text: str | None,
+    brand_id: UUID | None = None,
 ) -> list[EngineFinding]:
     try:
         inspection = inspect_image(image_bytes, alt_text=alt_text)
@@ -282,11 +340,16 @@ def _make_image_findings(
 
     findings: list[EngineFinding] = []
     for item in inspection["findings"]:
-        rule = db.query(Rule).filter(
+        query = db.query(Rule).filter(
             Rule.organisation_id == user.organisation_id,
             Rule.status == "approved",
             Rule.category == item["category"],
-        ).first()
+        )
+        if brand_id is None:
+            query = query.filter(Rule.brand_id.is_(None))
+        else:
+            query = query.filter(or_(Rule.brand_id.is_(None), Rule.brand_id == brand_id))
+        rule = query.first()
         source = (
             {"type": "rule", "id": str(rule.id), "clause_text": rule.text}
             if rule
@@ -523,12 +586,200 @@ def get_me(
     return profile.model_copy(update={"jury_demo": token_payload.get("session_type") == "jury_demo"})
 
 
+@api_router.get("/brands", response_model=list[BrandSchema])
+def list_brands(
+    q: str | None = None,
+    include_archived: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if include_archived and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view archived brands")
+    query = db.query(Brand).filter(Brand.organisation_id == current_user.organisation_id)
+    if not include_archived:
+        query = query.filter(Brand.status == "active")
+    if q and q.strip():
+        query = query.filter(func.lower(Brand.name).contains(q.strip().casefold()))
+    return [_brand_payload(brand) for brand in query.order_by(Brand.name.asc()).all()]
+
+
+@api_router.post("/brands", response_model=BrandSchema, status_code=status.HTTP_201_CREATED)
+def create_brand(
+    payload: BrandCreateSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["admin"])),
+):
+    duplicate = db.query(Brand.id).filter(
+        Brand.organisation_id == current_user.organisation_id,
+        func.lower(Brand.name) == payload.name.casefold(),
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="A brand with this name already exists in your organisation")
+    brand = Brand(
+        organisation_id=current_user.organisation_id,
+        status="active",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+        **payload.model_dump(),
+    )
+    db.add(brand)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A brand with this name already exists in your organisation") from exc
+    log_audit(
+        db, str(current_user.organisation_id), "CREATE_BRAND", "brand",
+        str(current_user.id), str(brand.id),
+    )
+    db.commit()
+    db.refresh(brand)
+    return _brand_payload(brand)
+
+
+@api_router.get("/brands/{brand_id}", response_model=BrandSchema)
+def get_brand(
+    brand_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    brand = _brand_or_404(
+        db, brand_id, current_user, active_only=current_user.role != "admin"
+    )
+    return _brand_payload(brand)
+
+
+@api_router.patch("/brands/{brand_id}", response_model=BrandSchema)
+def update_brand(
+    brand_id: UUID,
+    payload: BrandUpdateSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["admin"])),
+):
+    brand = _brand_or_404(db, brand_id, current_user, active_only=False)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide at least one brand field to update")
+    if "name" in changes:
+        if changes["name"] is None or not changes["name"].strip():
+            raise HTTPException(status_code=422, detail="Brand name cannot be empty")
+        changes["name"] = changes["name"].strip()
+        duplicate = db.query(Brand.id).filter(
+            Brand.organisation_id == current_user.organisation_id,
+            func.lower(Brand.name) == changes["name"].casefold(),
+            Brand.id != brand.id,
+        ).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail="A brand with this name already exists in your organisation")
+    for field, value in changes.items():
+        setattr(brand, field, value)
+    log_audit(
+        db, str(current_user.organisation_id), "UPDATE_BRAND", "brand",
+        str(current_user.id), str(brand.id),
+    )
+    db.commit()
+    db.refresh(brand)
+    return _brand_payload(brand)
+
+
+@api_router.post("/brands/{brand_id}/archive", response_model=BrandSchema)
+def archive_brand(
+    brand_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["admin"])),
+):
+    brand = _brand_or_404(db, brand_id, current_user, active_only=False)
+    if brand.status != "archived":
+        brand.status = "archived"
+        log_audit(
+            db, str(current_user.organisation_id), "ARCHIVE_BRAND", "brand",
+            str(current_user.id), str(brand.id),
+        )
+        db.commit()
+        db.refresh(brand)
+    return _brand_payload(brand)
+
+
+@api_router.post("/brands/{brand_id}/logo", response_model=BrandSchema)
+async def upload_brand_logo(
+    brand_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["admin"])),
+):
+    brand = _brand_or_404(db, brand_id, current_user)
+    data = await file.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Logo file exceeds the 2 MB upload limit")
+    try:
+        from PIL import Image, UnidentifiedImageError
+
+        image = Image.open(io.BytesIO(data))
+        if image.format not in {"PNG", "JPEG", "WEBP"}:
+            raise HTTPException(status_code=415, detail="Logo must be a PNG, JPEG, or WebP image")
+        if image.width < 1 or image.height < 1 or image.width * image.height > 16_000_000:
+            raise HTTPException(status_code=422, detail="Logo dimensions exceed the supported 16 megapixel limit")
+        image.verify()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Image validation is unavailable") from exc
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        raise HTTPException(status_code=415, detail="Logo must be a valid PNG, JPEG, or WebP image") from exc
+
+    image_format = image.format.lower()
+    media_type = {"jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[image_format]
+    try:
+        brand.logo_file_key = store_file(
+            str(current_user.organisation_id),
+            "brand-logos",
+            f"brand-logo.{image_format}",
+            data,
+            media_type,
+        )
+    except (StorageUnavailable, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    log_audit(
+        db, str(current_user.organisation_id), "UPLOAD_BRAND_LOGO", "brand",
+        str(current_user.id), str(brand.id),
+    )
+    db.commit()
+    db.refresh(brand)
+    return _brand_payload(brand)
+
+
+@api_router.get("/brands/{brand_id}/logo")
+def get_brand_logo(
+    brand_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    brand = _brand_or_404(
+        db, brand_id, current_user, active_only=current_user.role != "admin"
+    )
+    if not brand.logo_file_key:
+        raise HTTPException(status_code=404, detail="Brand logo not found")
+    try:
+        data = read_file(brand.logo_file_key)
+    except (StorageUnavailable, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    suffix = Path(brand.logo_file_key).suffix.casefold()
+    media_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
+    if media_type is None:
+        raise HTTPException(status_code=415, detail="Stored brand logo has an unsupported media type")
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"},
+    )
+
+
 @api_router.post("/kb/guidelines", status_code=status.HTTP_201_CREATED)
 async def upload_guideline(
     file: UploadFile = File(...),
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     filename = Path(file.filename or "guideline").name
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
@@ -557,6 +808,7 @@ async def upload_guideline(
 
     document = GuidelineDoc(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         title=filename,
         file_path=file_key,
     )
@@ -568,6 +820,7 @@ async def upload_guideline(
     for draft in drafts:
         rule = Rule(
             organisation_id=current_user.organisation_id,
+            brand_id=brand_id,
             guideline_id=document.id,
             clause_number=draft["clause_number"] or f"DRAFT-{len(rules) + 1:03d}",
             text=draft["text"],
@@ -598,20 +851,32 @@ async def upload_guideline(
 
 
 @api_router.get("/kb/rules")
-def list_rules(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    rows = db.query(Rule).filter(Rule.organisation_id == current_user.organisation_id).all()
+def list_rules(
+    brand_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
+    query = db.query(Rule).filter(Rule.organisation_id == current_user.organisation_id)
+    if brand_id is not None:
+        query = query.filter(or_(Rule.brand_id.is_(None), Rule.brand_id == brand_id))
+    rows = query.all()
     return [_rule_schema(rule) for rule in rows]
 
 
 @api_router.post("/kb/rules", status_code=status.HTTP_201_CREATED)
 def create_rule(
     payload: RuleCreateSchema,
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     embedding = create_embedder().embed(payload.text)
     rule = Rule(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         clause_number=payload.clause_number,
         text=payload.text,
         category=payload.category,
@@ -633,14 +898,19 @@ def create_rule(
 def update_rule(
     rule_id: UUID,
     payload: dict[str, Any],
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
     rule = db.query(Rule).filter(
         Rule.id == rule_id,
         Rule.organisation_id == current_user.organisation_id,
     ).first()
     if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    if brand_id is not None and rule.brand_id not in {None, brand_id}:
         raise HTTPException(status_code=404, detail="Rule not found")
     allowed = {"clause_number", "text", "category", "channels", "type", "config", "status"}
     unknown = set(payload) - allowed
@@ -662,20 +932,32 @@ def update_rule(
     return _rule_schema(rule)
 
 
-@api_router.get("/kb/facts")
-def list_facts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return db.query(Fact).filter(Fact.organisation_id == current_user.organisation_id).all()
+@api_router.get("/kb/facts", response_model=list[FactSchema])
+def list_facts(
+    brand_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
+    query = db.query(Fact).filter(Fact.organisation_id == current_user.organisation_id)
+    if brand_id is not None:
+        query = query.filter(or_(Fact.brand_id.is_(None), Fact.brand_id == brand_id))
+    return query.all()
 
 
-@api_router.post("/kb/facts", status_code=status.HTTP_201_CREATED)
+@api_router.post("/kb/facts", response_model=FactSchema, status_code=status.HTTP_201_CREATED)
 def create_fact(
     payload: FactCreateSchema,
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     fact_data = payload.model_dump()
     fact = Fact(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         **fact_data,
         embedding=create_embedder().embed(fact_data["text"]),
     )
@@ -687,18 +969,23 @@ def create_fact(
     return fact
 
 
-@api_router.patch("/kb/facts/{fact_id}")
+@api_router.patch("/kb/facts/{fact_id}", response_model=FactSchema)
 def update_fact(
     fact_id: UUID,
     payload: FactUpdateSchema,
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
     fact = db.query(Fact).filter(
         Fact.id == fact_id,
         Fact.organisation_id == current_user.organisation_id,
     ).first()
     if not fact:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    if brand_id is not None and fact.brand_id not in {None, brand_id}:
         raise HTTPException(status_code=404, detail="Fact not found")
     changes = payload.model_dump(exclude_unset=True)
     if changes.get("status") not in {None, "approved", "expired", "rejected"}:
@@ -722,20 +1009,32 @@ def update_fact(
     return fact
 
 
-@api_router.get("/kb/terms")
-def list_terms(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return db.query(Term).filter(Term.organisation_id == current_user.organisation_id).all()
+@api_router.get("/kb/terms", response_model=list[TermSchema])
+def list_terms(
+    brand_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
+    query = db.query(Term).filter(Term.organisation_id == current_user.organisation_id)
+    if brand_id is not None:
+        query = query.filter(or_(Term.brand_id.is_(None), Term.brand_id == brand_id))
+    return query.all()
 
 
-@api_router.post("/kb/terms", status_code=status.HTTP_201_CREATED)
+@api_router.post("/kb/terms", response_model=TermSchema, status_code=status.HTTP_201_CREATED)
 def create_term(
     payload: TermCreateSchema,
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     term_data = payload.model_dump()
     term = Term(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         **term_data,
         embedding=create_embedder().embed(
             term_embedding_text(term_data["preferred"], term_data["banned"], term_data.get("notes"))
@@ -749,18 +1048,23 @@ def create_term(
     return term
 
 
-@api_router.patch("/kb/terms/{term_id}")
+@api_router.patch("/kb/terms/{term_id}", response_model=TermSchema)
 def update_term(
     term_id: UUID,
     payload: dict[str, Any],
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
     term = db.query(Term).filter(
         Term.id == term_id,
         Term.organisation_id == current_user.organisation_id,
     ).first()
     if not term:
+        raise HTTPException(status_code=404, detail="Term not found")
+    if brand_id is not None and term.brand_id not in {None, brand_id}:
         raise HTTPException(status_code=404, detail="Term not found")
     allowed = {"preferred", "banned", "notes"}
     unknown = set(payload) - allowed
@@ -784,17 +1088,28 @@ def update_term(
 
 
 @api_router.get("/kb/assets")
-def list_assets(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return db.query(Asset).filter(Asset.organisation_id == current_user.organisation_id).all()
+def list_assets(
+    brand_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
+    query = db.query(Asset).filter(Asset.organisation_id == current_user.organisation_id)
+    if brand_id is not None:
+        query = query.filter(or_(Asset.brand_id.is_(None), Asset.brand_id == brand_id))
+    return query.all()
 
 
 @api_router.post("/kb/assets", status_code=status.HTTP_201_CREATED)
 def create_asset(
     payload: AssetCreateSchema,
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
-    asset = Asset(organisation_id=current_user.organisation_id, **payload.model_dump())
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
+    asset = Asset(organisation_id=current_user.organisation_id, brand_id=brand_id, **payload.model_dump())
     db.add(asset)
     db.flush()
     log_audit(db, str(current_user.organisation_id), "CREATE_ASSET", "asset", str(current_user.id), str(asset.id))
@@ -808,9 +1123,11 @@ async def upload_asset(
     file: UploadFile = File(...),
     name: str = Form(...),
     metadata_json: str = Form("{}"),
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "manager"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     data = await file.read()
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"File exceeds the {MAX_UPLOAD_BYTES}-byte upload limit")
@@ -830,6 +1147,7 @@ async def upload_asset(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     asset = Asset(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         name=name,
         file_url=object_key,
         metadata_json=json.dumps(metadata),
@@ -858,11 +1176,14 @@ def download_asset(asset_id: UUID, db: Session = Depends(get_db), current_user: 
 @api_router.post("/content", status_code=status.HTTP_201_CREATED)
 def create_content(
     payload: ContentCreateSchema,
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["creator", "admin"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     content = ContentItem(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         creator_id=current_user.id,
         title=payload.title,
         status="draft",
@@ -890,9 +1211,11 @@ async def upload_content(
     intent: str = Form(...),
     channel: str = Form("general"),
     alt_text: str = Form(""),
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["creator", "admin"])),
 ):
+    brand_id = _validate_brand_scope(db, brand_id, current_user)
     filename = Path(file.filename or "upload").name
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
@@ -940,6 +1263,7 @@ async def upload_content(
 
     content = ContentItem(
         organisation_id=current_user.organisation_id,
+        brand_id=brand_id,
         creator_id=current_user.id,
         title=title,
         status="draft",
@@ -961,7 +1285,7 @@ async def upload_content(
     use_async_review = settings.REVIEW_ASYNC and file_key is not None
     if not use_async_review and suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
         extra_findings = _make_image_findings(
-            db, current_user, content.id, version.version_no, data, alt_text
+            db, current_user, content.id, version.version_no, data, alt_text, brand_id
         )
     if use_async_review:
         result = _schedule_review(db, current_user, content, version, extra_findings)
@@ -985,10 +1309,19 @@ async def upload_content(
 
 
 @api_router.get("/content")
-def list_content(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return db.query(ContentItem).filter(
+def list_content(
+    brand_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
+    query = db.query(ContentItem).filter(
         ContentItem.organisation_id == current_user.organisation_id
-    ).order_by(ContentItem.created_at.desc()).all()
+    )
+    if brand_id is not None:
+        query = query.filter(ContentItem.brand_id == brand_id)
+    return query.order_by(ContentItem.created_at.desc()).all()
 
 
 @api_router.get("/content/{content_id}")
@@ -1035,13 +1368,17 @@ def create_version(
         raise HTTPException(status_code=403, detail="Only the content creator can create a version")
     if content.status not in {"draft", "changes_requested", "needs_recheck"}:
         raise HTTPException(status_code=409, detail="Content is locked after it enters approval")
+    if not payload.body or not payload.body.strip():
+        raise HTTPException(status_code=422, detail="Version body cannot be empty")
     version_no = content.current_version_no + 1
+    ensure_version_history_is_immutable(db, content, version_no)
     version = ContentVersion(
         content_id=content.id,
         version_no=version_no,
         body=payload.body,
         intent=payload.intent,
         channel=payload.channel or "general",
+        status="draft",
     )
     db.add(version)
     content.current_version_no = version_no
@@ -1200,6 +1537,8 @@ def submit_content(
     content = _content_or_404(db, content_id, current_user)
     if current_user.role != "admin" and content.creator_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the content creator can submit this item")
+    if content.status not in {"draft", "changes_requested", "needs_recheck"}:
+        raise HTTPException(status_code=409, detail="Content can only be submitted from draft, changes requested, or recheck states")
     version = _latest_version(db, content)
     if content.status == "needs_recheck" or version.status != "reviewed":
         raise HTTPException(status_code=409, detail="Run and complete a review before submitting this version")
@@ -1208,7 +1547,7 @@ def submit_content(
         FindingDecision.finding_id == row.id
     ).first() for row in findings):
         raise HTTPException(status_code=409, detail="Resolve all high-risk and unverifiable findings before submitting")
-    transition_content_status(db, content, "in_review", str(current_user.id), str(current_user.organisation_id))
+    transition_content_status(db, content, "in_review", str(current_user.id), str(current_user.organisation_id), user_role=current_user.role)
     db.commit()
     db.refresh(content)
     return content
@@ -1221,6 +1560,8 @@ def approve_content(
     current_user: User = Depends(require_role(["reviewer", "manager", "admin"])),
 ):
     content = _content_or_404(db, content_id, current_user)
+    if content.status not in {"in_review", "queued", "needs_recheck"}:
+        raise HTTPException(status_code=409, detail="Content must be in review before it can be approved")
     version = _latest_version(db, content)
     findings = db.query(Finding).filter(Finding.content_version_id == version.id).all()
     undecided_risks = []
@@ -1244,7 +1585,7 @@ def approve_content(
             status_code=403,
             detail="A named reviewer must approve content containing claims or unverifiable findings.",
         )
-    transition_content_status(db, content, "approved", str(current_user.id), str(current_user.organisation_id))
+    transition_content_status(db, content, "approved", str(current_user.id), str(current_user.organisation_id), user_role=current_user.role)
     db.commit()
     db.refresh(content)
     return content
@@ -1257,7 +1598,9 @@ def request_changes_content(
     current_user: User = Depends(require_role(["reviewer", "manager", "admin"])),
 ):
     content = _content_or_404(db, content_id, current_user)
-    transition_content_status(db, content, "changes_requested", str(current_user.id), str(current_user.organisation_id))
+    if content.status not in {"in_review", "queued", "needs_recheck"}:
+        raise HTTPException(status_code=409, detail="Only active reviews can request changes")
+    transition_content_status(db, content, "changes_requested", str(current_user.id), str(current_user.organisation_id), user_role=current_user.role)
     db.commit()
     db.refresh(content)
     return content
@@ -1265,13 +1608,19 @@ def request_changes_content(
 
 @api_router.get("/queue")
 def get_review_queue(
+    brand_id: UUID | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["reviewer", "manager", "admin"])),
 ):
-    return db.query(ContentItem).filter(
+    if brand_id is not None:
+        _validate_brand_scope(db, brand_id, current_user)
+    query = db.query(ContentItem).filter(
         ContentItem.organisation_id == current_user.organisation_id,
         ContentItem.status.in_(["in_review", "needs_recheck"]),
-    ).order_by(ContentItem.created_at.asc()).all()
+    )
+    if brand_id is not None:
+        query = query.filter(ContentItem.brand_id == brand_id)
+    return query.order_by(ContentItem.created_at.asc()).all()
 
 
 @api_router.post("/findings/{finding_id}/decision")
