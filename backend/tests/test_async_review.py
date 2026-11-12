@@ -44,6 +44,17 @@ def test_content_workflow_accepts_human_review_transitions_and_rejects_unsafe_ro
         pass
 
 
+def test_creator_can_submit_reviewed_draft_directly_to_reviewer_queue():
+    from app.workflow import transition_content_status
+
+    content = SimpleNamespace(id=uuid4(), status="draft")
+    db = SimpleNamespace(add=lambda *args, **kwargs: None, flush=lambda: None)
+
+    transition_content_status(db, content, "in_review", "creator-1", "org-1", user_role="creator")
+
+    assert content.status == "in_review"
+
+
 def test_review_state_machine_rejects_resuming_terminal_job():
     with pytest.raises(ValueError, match="Illegal review status transition"):
         validate_review_transition("completed", "running")

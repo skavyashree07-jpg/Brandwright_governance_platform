@@ -18,7 +18,9 @@ VALID_TRANSITIONS = {
 REVIEWER_ROLES = {"reviewer", "admin", "manager"}
 CREATOR_ROLES = {"creator", "admin"}
 STRICT_ROLE_TRANSITIONS = {
-    "creator": {"draft": {"submitted"}, "changes_requested": {"resubmitted"}, "needs_recheck": {"submitted", "draft"}},
+    # The API submits reviewed drafts directly to the active reviewer queue (in_review).
+    # Keep the explicit submitted transition for callers using the staged queue flow.
+    "creator": {"draft": {"submitted", "in_review"}, "changes_requested": {"resubmitted"}, "needs_recheck": {"submitted", "draft"}},
     "reviewer": {"submitted": {"queued"}, "queued": {"in_review", "changes_requested", "rejected"}, "in_review": {"approved", "changes_requested", "rejected", "queued"}, "resubmitted": {"queued"}},
     "manager": {"submitted": {"queued"}, "queued": {"in_review", "changes_requested", "rejected"}, "in_review": {"approved", "changes_requested", "rejected", "queued"}, "resubmitted": {"queued"}},
     "admin": {"draft": {"submitted", "in_review"}, "submitted": {"queued", "draft"}, "queued": {"in_review", "changes_requested", "rejected"}, "in_review": {"approved", "changes_requested", "rejected", "queued"}, "changes_requested": {"resubmitted", "draft"}, "resubmitted": {"queued", "draft"}, "needs_recheck": {"in_review", "draft", "submitted"}},
